@@ -80,13 +80,22 @@ def stamped_manifest(version: str, source: Path = MCPB_SOURCE / "manifest.json")
     return json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 
 
+def stamped_pyproject(version: str, source: Path = MCPB_SOURCE / "pyproject.toml.in") -> str:
+    """Return the bundle's pyproject.toml with the release version filled in."""
+    return source.read_text(encoding="utf-8").replace("@VERSION@", version)
+
+
 def stage_mcpb(stage: Path, wheel: Path, version: str, source: Path = MCPB_SOURCE) -> None:
-    """Lay out the bundle: manifest, launcher, wheel and license."""
+    """Lay out the bundle: manifest, project file, entry point, wheel and license."""
+    if wheel.name != f"freecad_mcp-{version}-py3-none-any.whl":
+        raise BuildError(f"Bundle expects freecad_mcp-{version}-py3-none-any.whl, got {wheel.name}")
     if stage.exists():
         shutil.rmtree(stage)
     (stage / "server").mkdir(parents=True)
+    (stage / "src").mkdir()
     (stage / "manifest.json").write_text(stamped_manifest(version, source / "manifest.json"), encoding="utf-8")
-    shutil.copy2(source / "server" / "launcher.js", stage / "server" / "launcher.js")
+    (stage / "pyproject.toml").write_text(stamped_pyproject(version, source / "pyproject.toml.in"), encoding="utf-8")
+    shutil.copy2(source / "src" / "server.py", stage / "src" / "server.py")
     shutil.copy2(wheel, stage / "server" / wheel.name)
     shutil.copy2(ROOT / "LICENSE", stage / "LICENSE")
 

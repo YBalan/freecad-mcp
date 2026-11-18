@@ -1,0 +1,13 @@
+# The Claude Desktop bundle's own project (template: scripts/build_installers.py fills in
+# @VERSION@ and writes pyproject.toml). It only says "install the freecad-mcp wheel that
+# ships inside this bundle", so the server always matches the addon of the same release.
+# uv builds an environment from it the first time the extension starts.
+[project]
+name = "freecad-mcp-bundle"
+version = "@VERSION@"
+description = "Claude Desktop bundle for freecad-mcp"
+requires-python = ">=3.12"
+dependencies = ["freecad-mcp"]
+
+[tool.uv.sources]
+freecad-mcp = { path = "server/freecad_mcp-@VERSION@-py3-none-any.whl" }

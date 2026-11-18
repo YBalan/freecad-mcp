@@ -82,6 +82,15 @@ Claude Desktop. The installer also adds a Start menu shortcut for it. The bundle
 FreeCAD must still run with the addon installed and its RPC server started. The
 bundle is unsigned; Claude Desktop may say so when installing it.
 
+The bundle is a `uv` extension (manifest version 0.4), so it needs a Claude
+Desktop version that supports them. This is deliberate: Claude Desktop runs
+`node` extensions inside an Electron utility process whose stdio is a message
+port, so a Node wrapper that forwards stdio to a child process never answers
+(the extension shows "Not responding"). A `uv` extension runs as a normal
+process with real pipes. If you see that error, check
+`%LOCALAPPDATA%\Claude\logs\mcp-server-FreeCAD MCP.log` and make sure `uv` is
+installed.
+
 ## Claude Code
 
 `.mcpb` is Claude Desktop's extension format. Claude Code registers MCP servers
@@ -129,4 +138,4 @@ Node.js and network) and `--iscc <path>` if Inno Setup is not auto-detected. The
 version comes from `addon/FreeCADMCP/package.xml`, so
 [`bump_version.py`](installation.md#update-the-release-version) remains the only
 place to change it. The pytest suite checks that the bundle manifest lists exactly
-the registered tools and that the launcher ignores unset settings.
+the registered tools and that the bundle's entry point ignores unset settings.

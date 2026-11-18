@@ -3,11 +3,13 @@
 import asyncio
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import tomllib
 import zipfile
 
 import pytest
@@ -16,17 +18,23 @@ from freecad_mcp.server import mcp
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build_installers.py"
-MANIFEST = ROOT / "installer" / "mcpb" / "manifest.json"
-LAUNCHER = ROOT / "installer" / "mcpb" / "server" / "launcher.js"
+BUNDLE = ROOT / "installer" / "mcpb"
+MANIFEST = BUNDLE / "manifest.json"
+ENTRY = BUNDLE / "src" / "server.py"
 HELPER = ROOT / "installer" / "windows" / "freecad-mcp-setup.ps1"
 INNO = ROOT / "installer" / "windows" / "FreeCADMCP.iss"
 
-spec = importlib.util.spec_from_file_location("build_installers", SCRIPT)
-assert spec is not None and spec.loader is not None
-build = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(build)
 
-needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is not installed")
+def load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+build = load("build_installers", SCRIPT)
+entry = load("bundle_entry", ENTRY)
 
 
 def manifest() -> dict:
@@ -40,24 +48,29 @@ def test_manifest_lists_exactly_the_registered_tools() -> None:
     assert set(listed) == registered
 
 
-def test_manifest_user_config_is_wired_to_the_launcher() -> None:
+def test_manifest_runs_the_entry_point_as_a_uv_project() -> None:
+    # Claude Desktop runs "node" bundles inside an Electron UtilityProcess whose stdio is a
+    # message port, so a wrapper that forwards stdio to a child hangs. "uv" bundles run as
+    # a real process with real pipes.
     data = manifest()
     server = data["server"]
-    assert data["manifest_version"] == "0.3"
-    assert (MANIFEST.parent / server["entry_point"]).is_file()
-    assert server["entry_point"] in " ".join(server["mcp_config"]["args"]).replace("${__dirname}/", "")
+    assert data["manifest_version"] == "0.4"
+    assert server["type"] == "uv"
+    assert (BUNDLE / server["entry_point"]).is_file()
+    assert server["mcp_config"]["command"] == "uv"
+    assert server["mcp_config"]["args"] == ["run", "--directory", "${__dirname}", server["entry_point"]]
 
-    env = server["mcp_config"]["env"]
-    referenced = {
-        name for value in env.values() for name in re.findall(r"\$\{user_config\.([^}]+)\}", value)
-    }
+
+def test_manifest_user_config_is_wired_to_the_entry_point() -> None:
+    data = manifest()
+    env = data["server"]["mcp_config"]["env"]
+    referenced = {name for value in env.values() for name in re.findall(r"\$\{user_config\.([^}]+)\}", value)}
     assert referenced == set(data["user_config"])
-    # The launcher reads exactly these variables.
-    launcher = LAUNCHER.read_text(encoding="utf-8")
-    prefix = re.search(r'const PREFIX = "([^"]+)"', launcher).group(1)
-    assert all(key.startswith(prefix) for key in env)
+    # The entry point reads exactly these variables.
+    source = ENTRY.read_text(encoding="utf-8")
+    assert all(key.startswith(entry.PREFIX) for key in env)
     for key in env:
-        assert f'"{key[len(prefix):]}"' in launcher
+        assert f'"{key[len(entry.PREFIX):]}"' in source
     # Optional settings must not block installation.
     assert not any(option.get("required") for option in data["user_config"].values())
     assert data["user_config"]["auth_token"]["sensitive"] is True
@@ -79,20 +92,34 @@ def test_stage_and_archive_are_versioned_and_deterministic(tmp_path: Path) -> No
     with zipfile.ZipFile(outputs[0]) as archive:
         names = archive.namelist()
         assert names[0] == "manifest.json"
-        assert set(names) == {"manifest.json", "LICENSE", "server/launcher.js", f"server/{wheel.name}"}
+        assert set(names) == {"manifest.json", "LICENSE", "pyproject.toml", "src/server.py", f"server/{wheel.name}"}
         stamped = json.loads(archive.read("manifest.json"))
+        project = tomllib.loads(archive.read("pyproject.toml").decode("utf-8"))
     assert stamped["version"] == "9.8.7"
     assert {k: v for k, v in stamped.items() if k != "version"} == {k: v for k, v in manifest().items() if k != "version"}
+    # The bundle project installs the wheel that ships inside it, not whatever is on PyPI.
+    assert project["project"]["version"] == "9.8.7"
+    assert project["project"]["dependencies"] == ["freecad-mcp"]
+    assert project["tool"]["uv"]["sources"]["freecad-mcp"] == {"path": f"server/{wheel.name}"}
+    assert project["project"]["requires-python"] == ">=3.12"
+
+
+def test_staging_rejects_a_wheel_of_another_version(tmp_path: Path) -> None:
+    wheel = tmp_path / "freecad_mcp-1.0.0-py3-none-any.whl"
+    wheel.write_bytes(b"x")
+    with pytest.raises(build.BuildError, match="freecad_mcp-2.0.0"):
+        build.stage_mcpb(tmp_path / "stage", wheel, "2.0.0")
 
 
 def test_build_script_reads_the_single_release_version() -> None:
     assert re.fullmatch(r"\d+\.\d+\.\d+", build.package_version())
-    # No second version literal: the bundle manifest is stamped at build time.
+    # No second version literal: the bundle files are stamped at build time.
     assert manifest()["version"] == "0.0.0"
     assert "AppVersion={#AppVersion}" in INNO.read_text(encoding="utf-8")
+    assert "@VERSION@" not in build.stamped_pyproject("1.2.3")
 
 
-def test_missing_inno_setup_is_reported(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_missing_inno_setup_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
     for variable in ("ISCC", "LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
@@ -100,76 +127,82 @@ def test_missing_inno_setup_is_reported(monkeypatch: pytest.MonkeyPatch, tmp_pat
         build.find_iscc()
 
 
-# --- launcher (needs Node.js, which every MCPB host ships) -------------------------------------
+# --- bundle entry point ------------------------------------------------------------------------
 
-LAUNCH_SNIPPET = """
-const launcher = require(process.argv[1]);
-const result = launcher.buildLaunch({ env: JSON.parse(process.argv[2]), uv: "uv", wheel: "w.whl" });
-console.log(JSON.stringify(result));
-"""
-
-BASE_ARGS = ["tool", "run", "--python", ">=3.12", "--from", "w.whl", "freecad-mcp"]
-
-
-def launch(env: dict[str, str]) -> dict:
-    # Keep PATH so detection of FreeCADCmd behaves like a normal run, minus host-specific folders.
-    completed = subprocess.run(
-        ["node", "-e", LAUNCH_SNIPPET, str(LAUNCHER), json.dumps(env)],
-        capture_output=True, text=True, check=True, timeout=30,
-    )
-    return json.loads(completed.stdout)
+UNFILLED = {
+    "FREECAD_MCP_BUNDLE_HOST": "${user_config.host}",
+    "FREECAD_MCP_BUNDLE_AUTH_TOKEN": "${user_config.auth_token}",
+    "FREECAD_MCP_BUNDLE_ONLY_TEXT": "${user_config.only_text_feedback}",
+    "FREECAD_MCP_BUNDLE_FREECADCMD": "${user_config.freecadcmd}",
+    "PATH": "",
+}
 
 
-@needs_node
-def test_launcher_ignores_unfilled_placeholders() -> None:
-    result = launch({
-        "FREECAD_MCP_BUNDLE_HOST": "${user_config.host}",
-        "FREECAD_MCP_BUNDLE_AUTH_TOKEN": "${user_config.auth_token}",
-        "FREECAD_MCP_BUNDLE_ONLY_TEXT": "${user_config.only_text_feedback}",
-        "FREECAD_MCP_BUNDLE_FREECADCMD": "${user_config.freecadcmd}",
-        "PATH": "",
-    })
-    assert result["args"] == BASE_ARGS
-    assert "FREECAD_MCP_TOKEN" not in result["env"]
-    assert not [key for key in result["env"] if key.startswith("FREECAD_MCP_BUNDLE_")]
+def test_entry_ignores_unfilled_placeholders() -> None:
+    assert entry.prepare(UNFILLED) == ([], "")
 
 
-@needs_node
-def test_launcher_passes_settings_and_keeps_the_token_out_of_argv() -> None:
-    result = launch({
+def test_entry_passes_settings_and_keeps_the_token_out_of_argv() -> None:
+    argv, token = entry.prepare({
         "FREECAD_MCP_BUNDLE_HOST": "192.168.1.50",
         "FREECAD_MCP_BUNDLE_AUTH_TOKEN": "s3cret-token",
         "FREECAD_MCP_BUNDLE_ONLY_TEXT": "true",
         "FREECAD_MCP_BUNDLE_FREECADCMD": "C:\\Program Files\\FreeCAD 1.1\\bin\\FreeCADCmd.exe",
         "PATH": "",
     })
-    assert result["args"] == BASE_ARGS + [
+    assert argv == [
         "--host", "192.168.1.50",
         "--only-text-feedback",
         "--freecadcmd", "C:\\Program Files\\FreeCAD 1.1\\bin\\FreeCADCmd.exe",
     ]
-    assert result["env"]["FREECAD_MCP_TOKEN"] == "s3cret-token"
-    assert "s3cret-token" not in " ".join(result["args"])
+    assert token == "s3cret-token"
+    assert "s3cret-token" not in " ".join(argv)
 
 
-@needs_node
-def test_launcher_treats_false_as_disabled() -> None:
-    result = launch({"FREECAD_MCP_BUNDLE_ONLY_TEXT": "false", "PATH": ""})
-    assert "--only-text-feedback" not in result["args"]
+def test_entry_treats_false_as_disabled() -> None:
+    assert entry.prepare({"FREECAD_MCP_BUNDLE_ONLY_TEXT": "false", "PATH": ""}) == ([], "")
 
 
-@needs_node
-def test_launcher_without_uv_explains_how_to_install_it(tmp_path: Path) -> None:
-    # An empty HOME/PATH leaves no place for uv to be found.
-    env = {"PATH": str(tmp_path), "HOME": str(tmp_path), "USERPROFILE": str(tmp_path), "LOCALAPPDATA": str(tmp_path)}
-    completed = subprocess.run(
-        ["node", str(LAUNCHER)], capture_output=True, text=True, env=env, timeout=30, stdin=subprocess.DEVNULL,
-    )
-    if completed.returncode == 0:  # pragma: no cover - a uv in a system folder the launcher also searches
-        pytest.skip("uv exists in a system folder on this machine")
-    assert completed.returncode in (127, 1)
-    assert "uv" in completed.stderr
-    assert completed.stdout == ""  # stdout is reserved for the MCP protocol
+@pytest.mark.skipif(sys.platform != "win32", reason="Default FreeCAD folders are Windows-specific")
+def test_entry_finds_the_newest_default_freecadcmd(tmp_path: Path) -> None:
+    for name in ("FreeCAD 0.21", "FreeCAD 1.0", "FreeCAD 1.1", "NotFreeCAD 9.9"):
+        (tmp_path / name / "bin").mkdir(parents=True)
+        (tmp_path / name / "bin" / "FreeCADCmd.exe").write_bytes(b"")
+    (tmp_path / "FreeCAD 2.0" / "bin").mkdir(parents=True)  # no FreeCADCmd.exe: must be skipped
+    env = {"ProgramFiles": str(tmp_path), "PATH": ""}
+    assert entry.detect_freecadcmd(env) == str(tmp_path / "FreeCAD 1.1" / "bin" / "FreeCADCmd.exe")
+
+
+def test_entry_leaves_freecadcmd_to_the_server_when_it_is_on_path(tmp_path: Path) -> None:
+    program = tmp_path / ("freecadcmd.exe" if sys.platform == "win32" else "freecadcmd")
+    program.write_bytes(b"")
+    program.chmod(0o755)
+    assert entry.detect_freecadcmd({"PATH": str(tmp_path)}) == ""
+
+
+def test_entry_main_hands_the_server_its_arguments_and_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    import freecad_mcp.server as server
+
+    seen: dict[str, object] = {}
+
+    def fake_main() -> None:
+        seen["argv"] = list(sys.argv)
+        seen["token"] = os.environ.get("FREECAD_MCP_TOKEN")
+        seen["bundle_vars"] = [key for key in os.environ if key.startswith(entry.PREFIX)]
+
+    monkeypatch.setattr(server, "main", fake_main)
+    monkeypatch.setattr(sys, "argv", ["server.py"])
+    monkeypatch.delenv("FREECAD_MCP_TOKEN", raising=False)
+    monkeypatch.setenv("FREECAD_MCP_BUNDLE_HOST", "10.0.0.5")
+    monkeypatch.setenv("FREECAD_MCP_BUNDLE_AUTH_TOKEN", "tok")
+    monkeypatch.setenv("FREECAD_MCP_BUNDLE_ONLY_TEXT", "true")
+    monkeypatch.setenv("FREECAD_MCP_BUNDLE_FREECADCMD", "${user_config.freecadcmd}")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    entry.main()
+    assert seen["argv"][:4] == ["freecad-mcp", "--host", "10.0.0.5", "--only-text-feedback"]
+    assert seen["token"] == "tok"
+    assert seen["bundle_vars"] == []
+    monkeypatch.delenv("FREECAD_MCP_TOKEN", raising=False)  # main() set it outside monkeypatch's records
 
 
 # --- Windows installer assets --------------------------------------------------------------------
