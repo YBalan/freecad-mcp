@@ -1,0 +1,88 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-v0.3.schema.json",
+  "manifest_version": "0.3",
+  "name": "freecad-mcp",
+  "display_name": "FreeCAD MCP",
+  "version": "0.0.0",
+  "description": "Control FreeCAD from Claude: create and edit models, run Python scripts, inspect documents and run FEM analyses.",
+  "long_description": "Connects Claude to a running FreeCAD through the FreeCAD MCP addon.\n\n**Requirements**\n- FreeCAD with the FreeCAD MCP addon installed (the Windows installer does this for you) and its RPC server started from the *FreeCAD MCP* toolbar.\n- [uv](https://docs.astral.sh/uv/) on this computer. The bundle runs its MCP server through uv, which downloads Python 3.12 or later automatically if needed. The first start downloads the server's dependencies and can take a while.\n\nThe RPC connection defaults to localhost. Use the settings below for a remote FreeCAD, an auth token, text-only feedback, or a custom FreeCADCmd for headless scripts.",
+  "author": {
+    "name": "neka-nat",
+    "url": "https://github.com/neka-nat"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/neka-nat/freecad-mcp"
+  },
+  "homepage": "https://github.com/neka-nat/freecad-mcp",
+  "documentation": "https://github.com/neka-nat/freecad-mcp/tree/main/docs",
+  "support": "https://github.com/neka-nat/freecad-mcp/issues",
+  "server": {
+    "type": "node",
+    "entry_point": "server/launcher.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/launcher.js"],
+      "env": {
+        "FREECAD_MCP_BUNDLE_HOST": "${user_config.host}",
+        "FREECAD_MCP_BUNDLE_AUTH_TOKEN": "${user_config.auth_token}",
+        "FREECAD_MCP_BUNDLE_ONLY_TEXT": "${user_config.only_text_feedback}",
+        "FREECAD_MCP_BUNDLE_FREECADCMD": "${user_config.freecadcmd}"
+      }
+    }
+  },
+  "tools": [
+    { "name": "create_document", "description": "Create a new FreeCAD document." },
+    { "name": "list_documents", "description": "List open documents." },
+    { "name": "reload_document", "description": "Close and reopen a saved document to pick up external file changes." },
+    { "name": "create_object", "description": "Create an object in a document." },
+    { "name": "edit_object", "description": "Edit an object's properties." },
+    { "name": "delete_object", "description": "Delete an object from a document." },
+    { "name": "get_objects", "description": "Get all objects in a document." },
+    { "name": "get_object", "description": "Get one object in a document." },
+    { "name": "get_view", "description": "Get a screenshot of the active view." },
+    { "name": "execute_code", "description": "Execute Python code on FreeCAD's GUI thread." },
+    { "name": "execute_code_async", "description": "Start a background computation and return its job ID." },
+    { "name": "get_async_status", "description": "Get background job state and failure tracebacks." },
+    { "name": "get_task_status", "description": "Poll a timed-out GUI operation without waiting for the GUI thread." },
+    { "name": "execute_code_headless", "description": "Run a script in a separate headless FreeCAD process." },
+    { "name": "get_rpc_status", "description": "Report RPC and GUI-dispatch health, addon version and version check." },
+    { "name": "insert_part_from_library", "description": "Insert a part from the FreeCAD parts library." },
+    { "name": "get_parts_list", "description": "List parts in the FreeCAD parts library." },
+    { "name": "run_fem_analysis", "description": "Run CalculiX on an existing FEM analysis and return summary results." }
+  ],
+  "keywords": ["freecad", "cad", "3d-modeling", "fem", "mcp"],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["win32", "darwin"]
+  },
+  "user_config": {
+    "host": {
+      "type": "string",
+      "title": "FreeCAD RPC host",
+      "description": "Host of the FreeCAD RPC server. Keep localhost unless FreeCAD runs on another machine with remote connections enabled.",
+      "default": "localhost",
+      "required": false
+    },
+    "auth_token": {
+      "type": "string",
+      "title": "RPC auth token",
+      "description": "Only needed if you set an auth token in the FreeCAD MCP toolbar. Leave empty otherwise.",
+      "sensitive": true,
+      "required": false
+    },
+    "only_text_feedback": {
+      "type": "boolean",
+      "title": "Text-only feedback",
+      "description": "Omit screenshots from tool results to reduce token use.",
+      "default": false,
+      "required": false
+    },
+    "freecadcmd": {
+      "type": "file",
+      "title": "FreeCADCmd executable (optional)",
+      "description": "Used by execute_code_headless. Leave empty to auto-detect (PATH, then the default Windows install folders).",
+      "required": false
+    }
+  }
+}

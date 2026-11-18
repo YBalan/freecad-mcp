@@ -20,6 +20,7 @@ htmlcov/
 !.env.example
 
 # Editors / OS
-.vscode/
+.vscode/*
+!.vscode/tasks.json
 .idea/
 .DS_Store

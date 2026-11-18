@@ -10,6 +10,9 @@ FreeCAD with its bundled Python (which can be Python 3.11); the external MCP
 server runs with Python 3.12 or later, supplied by `uv` or a separate installation.
 Do not install the `freecad-mcp` package into FreeCAD's bundled Python.
 
+On Windows, the [installer](windows-installer.md) performs the steps below
+automatically, including installing missing dependencies.
+
 ## Install the addon
 
 ```bash
