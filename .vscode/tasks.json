@@ -13,12 +13,15 @@
     },
     {
       "label": "Create GitHub release",
-      "detail": "Builds the installer, then creates release v<version> from package.xml with the .exe and .mcpb attached. Needs the gh CLI and a committed, pushed HEAD.",
+      "detail": "Picks the version (a new patch version if the tag is taken), builds the installer and creates the release with the .exe and .mcpb attached, from the branch you are on. Needs the gh CLI and a committed, pushed HEAD.",
       "type": "process",
       "command": "uv",
-      "args": ["run", "--no-project", "python", "scripts/create_release.py", "--mode", "${input:releaseMode}"],
-      "dependsOn": "Build installer",
-      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "args": [
+        "run", "--no-project", "python", "scripts/create_release.py",
+        "--mode", "${input:releaseMode}",
+        "--release-as", "${input:releaseAs}"
+      ],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "focus": true },
       "problemMatcher": []
     }
   ],
@@ -29,6 +32,20 @@
       "description": "How should the GitHub release be created?",
       "options": ["draft", "publish", "prerelease"],
       "default": "draft"
+    },
+    {
+      "id": "releaseAs",
+      "type": "pickString",
+      "description": "Which version should be released?",
+      "options": [
+        { "label": "auto: current version, or the next patch version if its tag is taken", "value": "auto" },
+        { "label": "current: this version only (fails if it was already released)", "value": "current" },
+        { "label": "patch: bump to the next patch version, commit and push", "value": "patch" },
+        { "label": "minor: bump to the next minor version, commit and push", "value": "minor" },
+        { "label": "major: bump to the next major version, commit and push", "value": "major" },
+        { "label": "replace: delete the existing release and tag of this version, then recreate", "value": "replace" }
+      ],
+      "default": "auto"
     }
   ]
 }

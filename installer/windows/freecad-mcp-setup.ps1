@@ -12,18 +12,23 @@
   failure the result file contains an error= line and the exit code is 1.
 
   Actions
-    Check               Detect uv, Python >= 3.12, FreeCAD, winget and Claude Code.
-    InstallUv           Install uv for the current user (astral.sh installer, winget fallback).
-    InstallPython       Install Python 3.12 through uv.
-    InstallFreeCAD      Install FreeCAD through winget (FreeCAD's installer asks for elevation).
-    InstallServer       uv tool install the bundled freecad-mcp wheel.
-    InstallAddon        Copy the addon to <ModDir>\FreeCADMCP, backing up a previous copy.
-    RegisterClaudeCode  claude mcp add the server (user scope) unless a 'freecad' server exists.
-    Uninstall           Remove the uv tool, our Claude Code entry and the addon copy.
+    Check                    Detect uv, Python >= 3.12, FreeCAD, winget, Claude Code and Claude Desktop.
+    InstallUv                Install uv for the current user (astral.sh installer, winget fallback).
+    InstallPython            Install Python 3.12 through uv.
+    InstallFreeCAD           Install FreeCAD through winget (FreeCAD's installer asks for elevation).
+    InstallClaudeDesktop     Install Claude Desktop through winget when the app is missing.
+    FindServerProcesses      Report running freecad-mcp servers (started by Claude and the like).
+    StopServerProcesses      Stop them; Windows will not let uv replace files they have open.
+    InstallServer            uv tool install the bundled freecad-mcp wheel.
+    InstallAddon             Copy the addon to <ModDir>\FreeCADMCP, backing up a previous copy.
+    RegisterClaudeCode       claude mcp add the server (user scope) unless a 'freecad' server exists.
+    RegisterClaudeDesktop    Add the server to claude_desktop_config.json unless a 'freecad' entry exists.
+    UnregisterClaudeDesktop  Remove the 'freecad' entry from claude_desktop_config.json if it is ours.
+    Uninstall                Remove the uv tool, our Claude Code and Claude Desktop entries, and the addon copy.
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('', 'Check', 'InstallUv', 'InstallPython', 'InstallFreeCAD', 'InstallServer', 'InstallAddon', 'RegisterClaudeCode', 'Uninstall')]
+    [ValidateSet('', 'Check', 'InstallUv', 'InstallPython', 'InstallFreeCAD', 'InstallClaudeDesktop', 'FindServerProcesses', 'StopServerProcesses', 'InstallServer', 'InstallAddon', 'RegisterClaudeCode', 'RegisterClaudeDesktop', 'UnregisterClaudeDesktop', 'Uninstall')]
     [string]$Action = '',
     [string]$ResultFile = '',
     [string]$LogFile = '',
@@ -33,7 +38,12 @@ param(
     [string]$BackupDir = '',
     [string]$AddonDir = '',
     [string]$ServerExe = '',
-    [string]$FreeCADCmd = ''
+    [string]$FreeCADCmd = '',
+    [string]$DesktopConfig = '',
+    # Test seams: a stand-in winget, and the name of the Claude Desktop Store package to look for.
+    [string]$WingetPath = '',
+    [string]$ClaudeDesktopPackage = 'Claude',
+    [switch]$IgnoreUninstallEntries
 )
 
 $ErrorActionPreference = 'Stop'
@@ -217,6 +227,7 @@ function Get-InstalledFreeCADRoots {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     )
+    if ($IgnoreUninstallEntries) { $uninstallKeys = @() }
     foreach ($key in $uninstallKeys) {
         foreach ($item in (Get-ChildItem -Path $key -ErrorAction SilentlyContinue)) {
             $props = Get-ItemProperty -LiteralPath $item.PSPath -ErrorAction SilentlyContinue
@@ -289,6 +300,10 @@ function Find-Claude {
 }
 
 function Find-Winget {
+    if ($WingetPath) {
+        if (Test-Path -LiteralPath $WingetPath -PathType Leaf) { return $WingetPath }
+        return $null
+    }
     $command = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) { return $command.Source }
     return $null
@@ -320,8 +335,12 @@ function Invoke-Check {
     Write-Log ('freecad: {0}; addon folder: {1}' -f $values.freecad_status, $values.mod_dir)
 
     $values.winget_status = $(if (Find-Winget) { 'found' } else { 'missing' })
+    $values.claude_desktop_app = $(if (Test-ClaudeDesktopApp) { 'found' } else { 'missing' })
     $claude = Find-Claude
     $values.claude_status = $(if ($claude) { 'found' } else { 'missing' })
+    $desktop = Find-ClaudeDesktopConfig
+    $values.claude_desktop_status = $(if ($desktop) { 'found' } else { 'missing' })
+    $values.claude_desktop_config = $desktop
     Write-Result $values
 }
 
@@ -376,19 +395,171 @@ function Install-FreeCAD {
     }
     Write-Log 'Installing FreeCAD with winget (a Windows elevation prompt may appear; this can take several minutes).'
     Invoke-Logged -What 'winget install FreeCAD.FreeCAD' -FilePath $winget -TimeoutSec 1800 -AllowFailure `
-        -Arguments @('install', '--id', 'FreeCAD.FreeCAD', '--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') | Out-Null
+        -Arguments @('install', '--id', 'FreeCAD.FreeCAD', '--exact', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') | Out-Null
     if (-not (Find-FreeCAD)) {
         throw 'FreeCAD was not installed (the elevation prompt may have been declined). Install it from https://www.freecad.org/downloads.php and run this installer again.'
     }
     Write-Log 'FreeCAD installed.'
 }
 
+# ---------------------------------------------------------------- running servers
+
+function Get-UvPath {
+    # First line of `uv <args>` that looks like a Windows path, or ''.
+    param([string[]]$Arguments)
+    $uv = Find-Uv
+    if (-not $uv) { return '' }
+    try {
+        $result = Invoke-Native -FilePath $uv.Path -Arguments $Arguments -TimeoutSec 30
+        if ($result.ExitCode -eq 0) {
+            $line = $result.Output -split "\r?\n" | Where-Object { $_ -match '^\s*[A-Za-z]:\\' } | Select-Object -First 1
+            if ($line) { return $line.Trim() }
+        }
+    } catch { }
+    return ''
+}
+
+function Get-ServerProcesses {
+    # Processes running from the installed server: python.exe inside its uv tool environment
+    # and the freecad-mcp.exe launcher. A client such as Claude starts these and keeps them
+    # running, and Windows will not let uv delete or replace files a running program has open.
+    if ($null -eq $script:ToolDir) {
+        $script:ToolDir = $(if ($env:UV_TOOL_DIR) { $env:UV_TOOL_DIR } else { Get-UvPath @('tool', 'dir') })
+        if (-not $script:ToolDir -and $env:APPDATA) { $script:ToolDir = Join-Path $env:APPDATA 'uv\tools' }
+        $script:BinDir = $(if ($env:UV_TOOL_BIN_DIR) { $env:UV_TOOL_BIN_DIR } else { Get-UvPath @('tool', 'dir', '--bin') })
+        if (-not $script:BinDir -and $env:USERPROFILE) { $script:BinDir = Join-Path $env:USERPROFILE '.local\bin' }
+    }
+    $prefix = $(if ($script:ToolDir) { (Join-Path $script:ToolDir 'freecad-mcp').TrimEnd('\') + '\' } else { '' })
+    $launchers = @()
+    if ($script:BinDir) { $launchers += (Join-Path $script:BinDir 'freecad-mcp.exe') }
+    if ($ServerExe) { $launchers += $ServerExe }
+    $found = @()
+    foreach ($process in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $path = $process.ExecutablePath
+        if (-not $path) { continue }
+        $hit = [bool]($prefix -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase))
+        foreach ($launcher in $launchers) {
+            if ([string]::Equals($path, $launcher, [StringComparison]::OrdinalIgnoreCase)) { $hit = $true }
+        }
+        if ($hit) { $found += $process }
+    }
+    return $found
+}
+
+function Get-ProcessOwners {
+    # Names of the programs that started the given processes (the parents outside the group).
+    param($Processes)
+    $ids = @($Processes | ForEach-Object { $_.ProcessId })
+    $names = @()
+    foreach ($process in $Processes) {
+        if ($ids -contains $process.ParentProcessId) { continue }
+        $parent = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId={0}' -f $process.ParentProcessId) -ErrorAction SilentlyContinue
+        if ($parent -and $parent.Name) { $names += $parent.Name }
+    }
+    return @($names | Select-Object -Unique)
+}
+
+function Stop-ServerProcesses {
+    # Returns how many processes were stopped. Throws if some survive.
+    $found = @(Get-ServerProcesses)
+    if ($found.Count -eq 0) { return 0 }
+    foreach ($process in $found) {
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            Write-Log ('Stopped {0} (pid {1})' -f $process.Name, $process.ProcessId)
+        } catch {
+            # A child usually exits together with its parent, so it may already be gone.
+            if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) {
+                Write-Log ('Could not stop {0} (pid {1}): {2}' -f $process.Name, $process.ProcessId, $_.Exception.Message)
+            }
+        }
+    }
+    # Windows keeps the files locked until the processes have really gone.
+    $deadline = (Get-Date).AddSeconds(15)
+    do { Start-Sleep -Milliseconds 250; $left = @(Get-ServerProcesses) } while ($left.Count -gt 0 -and (Get-Date) -lt $deadline)
+    if ($left.Count -gt 0) {
+        throw ('The FreeCAD MCP server is still running (process {0}). Close the program that started it and try again.' -f (($left | ForEach-Object { $_.ProcessId }) -join ', '))
+    }
+    return $found.Count
+}
+
+function Invoke-FindServerProcesses {
+    $found = @(Get-ServerProcesses)
+    $owners = @(Get-ProcessOwners $found)
+    Write-Log ('{0} FreeCAD MCP server process(es) running; started by: {1}' -f $found.Count, ($owners -join ', '))
+    Write-Result @{
+        server_processes = $found.Count
+        server_process_ids = (($found | ForEach-Object { $_.ProcessId }) -join ',')
+        server_process_owners = ($owners -join ', ')
+    }
+}
+
+function Invoke-StopServerProcesses {
+    $count = Stop-ServerProcesses
+    Write-Result @{ server_processes_stopped = $count }
+}
+
+function Test-ClaudeDesktopApp {
+    # True when the Claude Desktop application itself is installed. Leftover data folders do not
+    # count: Claude keeps its settings after an uninstall.
+    try { if (Get-AppxPackage -Name $ClaudeDesktopPackage -ErrorAction Stop) { return $true } } catch { }
+    $programs = @()
+    if ($env:LOCALAPPDATA) {
+        $programs += (Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe')
+        $programs += (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe')
+    }
+    if ($env:ProgramFiles) { $programs += (Join-Path $env:ProgramFiles 'Claude\Claude.exe') }
+    foreach ($program in $programs) {
+        if (Test-Path -LiteralPath $program -PathType Leaf) { return $true }
+    }
+    $uninstallKeys = @(
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    if ($IgnoreUninstallEntries) { $uninstallKeys = @() }
+    foreach ($key in $uninstallKeys) {
+        foreach ($item in (Get-ChildItem -Path $key -ErrorAction SilentlyContinue)) {
+            $props = Get-ItemProperty -LiteralPath $item.PSPath -ErrorAction SilentlyContinue
+            if ($props -and $props.DisplayName -eq 'Claude' -and $props.Publisher -like 'Anthropic*') { return $true }
+        }
+    }
+    return $false
+}
+
+function Install-ClaudeDesktop {
+    if (Test-ClaudeDesktopApp) {
+        Write-Log 'Claude Desktop is already installed.'
+        Write-Result @{ claude_desktop_installed = 'already' }
+        return
+    }
+    $winget = Find-Winget
+    if (-not $winget) { throw 'winget is not available. Install Claude Desktop from https://claude.ai/download.' }
+    Write-Log 'Installing Claude Desktop with winget (this can take a few minutes).'
+    $result = Invoke-Logged -What 'winget install Anthropic.Claude' -FilePath $winget -TimeoutSec 1800 -AllowFailure `
+        -Arguments @('install', '--id', 'Anthropic.Claude', '--exact', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+    # A non-zero code can still mean "already there"; trust what is on the computer afterwards.
+    if ($result.ExitCode -ne 0 -and -not (Test-ClaudeDesktopApp)) {
+        throw ('Claude Desktop was not installed (winget exit code {0}). Install it from https://claude.ai/download.' -f $result.ExitCode)
+    }
+    Write-Log 'Claude Desktop installed.'
+    Write-Result @{ claude_desktop_installed = 'installed' }
+}
+
 function Install-Server {
     $uv = Find-Uv
     if (-not $uv) { throw 'uv was not found.' }
     if (-not (Test-Path -LiteralPath $WheelPath -PathType Leaf)) { throw ('Wheel not found: {0}' -f $WheelPath) }
-    Invoke-Logged -What 'uv tool install freecad-mcp' -FilePath $uv.Path -TimeoutSec 900 `
-        -Arguments @('tool', 'install', '--force', '--reinstall-package', 'freecad-mcp', '--python', $script:PythonRequest, $WheelPath) | Out-Null
+    try {
+        Invoke-Logged -What 'uv tool install freecad-mcp' -FilePath $uv.Path -TimeoutSec 900 `
+            -Arguments @('tool', 'install', '--force', '--reinstall-package', 'freecad-mcp', '--python', $script:PythonRequest, $WheelPath) | Out-Null
+    } catch {
+        $message = $_.Exception.Message
+        if ($message -match 'Access is denied|os error 5|os error 32|being used by another process') {
+            throw ('Setup could not replace the installed FreeCAD MCP server because a program is using it. Close Claude Desktop, Claude Code and any terminal running freecad-mcp, then run Setup again. ({0})' -f $message)
+        }
+        throw
+    }
     $bin = (Invoke-Logged -What 'uv tool dir --bin' -FilePath $uv.Path -TimeoutSec 60 -Arguments @('tool', 'dir', '--bin')).Output.Trim()
     $exe = Join-Path $bin 'freecad-mcp.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw ('freecad-mcp.exe was not created in {0}' -f $bin) }
@@ -452,7 +623,252 @@ function Register-ClaudeCode {
     Write-Result @{ claude_registered = 'added' }
 }
 
+# ---------------------------------------------------------------- Claude Desktop
+
+function Get-ClaudeDesktopProfileDirs {
+    # Folders that may hold claude_desktop_config.json, depending on how Claude Desktop was installed.
+    $dirs = New-Object System.Collections.Generic.List[string]
+    if ($env:LOCALAPPDATA) {
+        # Current builds keep per-user data outside the Store package: Claude-Data\<package family>.
+        $data = Join-Path $env:LOCALAPPDATA 'Claude-Data'
+        foreach ($dir in (Get-ChildItem -LiteralPath $data -Directory -ErrorAction SilentlyContinue)) { $dirs.Add($dir.FullName) }
+        # Earlier Store builds kept the profile inside the package (virtualized Roaming folder).
+        $packages = Join-Path $env:LOCALAPPDATA 'Packages'
+        foreach ($package in (Get-ChildItem -LiteralPath $packages -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue)) {
+            $dirs.Add((Join-Path $package.FullName 'LocalCache\Roaming\Claude'))
+        }
+    }
+    # The classic (non-Store) installer.
+    if ($env:APPDATA) { $dirs.Add((Join-Path $env:APPDATA 'Claude')) }
+    return $dirs
+}
+
+function Get-ClaudeDesktopConfigs {
+    # Existing claude_desktop_config.json files, most recently written first.
+    $files = @()
+    foreach ($dir in (Get-ClaudeDesktopProfileDirs)) {
+        $file = Join-Path $dir 'claude_desktop_config.json'
+        if (Test-Path -LiteralPath $file -PathType Leaf) { $files += (Get-Item -LiteralPath $file) }
+    }
+    return @($files | Sort-Object -Property LastWriteTime -Descending | ForEach-Object { $_.FullName })
+}
+
+function Find-ClaudeDesktopConfig {
+    # The file to register in: an existing one, else a new one inside a profile Claude Desktop
+    # has actually used. Returns '' when Claude Desktop settings cannot be found.
+    if ($DesktopConfig) { return $DesktopConfig }
+    $existing = @(Get-ClaudeDesktopConfigs)
+    if ($existing.Count -gt 0) { return $existing[0] }
+    $profiles = @()
+    foreach ($dir in (Get-ClaudeDesktopProfileDirs)) {
+        # A used profile has config.json or Local State. A leftover folder (such as the old package
+        # folder after Claude moved its data) has neither and must not receive a config file.
+        $used = (Test-Path -LiteralPath (Join-Path $dir 'config.json') -PathType Leaf) -or
+            (Test-Path -LiteralPath (Join-Path $dir 'Local State') -PathType Leaf)
+        if ($used) { $profiles += (Get-Item -LiteralPath $dir) }
+    }
+    if ($profiles.Count -eq 0) { return '' }
+    $newest = $profiles | Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1
+    return (Join-Path $newest.FullName 'claude_desktop_config.json')
+}
+
+function ConvertTo-JsonString {
+    param([string]$Text)
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    foreach ($char in $Text.ToCharArray()) {
+        $code = [int]$char
+        if ($code -eq 34) { [void]$builder.Append('\"') }
+        elseif ($code -eq 92) { [void]$builder.Append('\\') }
+        elseif ($code -eq 8) { [void]$builder.Append('\b') }
+        elseif ($code -eq 9) { [void]$builder.Append('\t') }
+        elseif ($code -eq 10) { [void]$builder.Append('\n') }
+        elseif ($code -eq 12) { [void]$builder.Append('\f') }
+        elseif ($code -eq 13) { [void]$builder.Append('\r') }
+        elseif ($code -lt 32) { [void]$builder.Append(('\u{0:x4}' -f $code)) }
+        else { [void]$builder.Append($char) }
+    }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function ConvertTo-JsonText {
+    # Two-space indented JSON like the one Claude Desktop writes. ConvertTo-Json in Windows
+    # PowerShell 5.1 produces a drifting layout and escapes apostrophes, which would turn a
+    # tidy settings file into a mess.
+    param($Value, [int]$Level = 0)
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [string]) { return (ConvertTo-JsonString $Value) }
+    if ($Value -is [bool]) { return $(if ($Value) { 'true' } else { 'false' }) }
+    if ($Value -is [datetime]) { return (ConvertTo-JsonString $Value.ToString('o')) }
+    $inner = '  ' * ($Level + 1)
+    $outer = '  ' * $Level
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [System.Management.Automation.PSCustomObject]) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        if ($Value -is [System.Collections.IDictionary]) {
+            foreach ($key in $Value.Keys) {
+                $lines.Add($inner + (ConvertTo-JsonString ([string]$key)) + ': ' + (ConvertTo-JsonText $Value[$key] ($Level + 1)))
+            }
+        } else {
+            foreach ($property in $Value.PSObject.Properties) {
+                $lines.Add($inner + (ConvertTo-JsonString $property.Name) + ': ' + (ConvertTo-JsonText $property.Value ($Level + 1)))
+            }
+        }
+        if ($lines.Count -eq 0) { return '{}' }
+        return ("{`n" + ($lines -join ",`n") + "`n" + $outer + '}')
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $lines = New-Object System.Collections.Generic.List[string]
+        foreach ($item in $Value) { $lines.Add($inner + (ConvertTo-JsonText $item ($Level + 1))) }
+        if ($lines.Count -eq 0) { return '[]' }
+        return ("[`n" + ($lines -join ",`n") + "`n" + $outer + ']')
+    }
+    if ($Value -is [double] -or $Value -is [single]) { return $Value.ToString('R', $culture) }
+    return [System.Convert]::ToString($Value, $culture)
+}
+
+function Invoke-WithRetry {
+    # Antivirus scanners, the search indexer and Claude Desktop itself can hold a settings file
+    # open for a moment, which makes reads and renames fail at random. Retry before giving up.
+    param([scriptblock]$Script, [int]$Attempts = 15, [int]$DelayMs = 200)
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        try { return (& $Script) }
+        catch {
+            if ($attempt -ge $Attempts) { throw }
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+
+function Read-JsonObject {
+    # Parse a JSON file that must hold an object; an empty file counts as {}. Anything else is
+    # an error so that the caller leaves the file alone.
+    param([string]$Path)
+    $text = Invoke-WithRetry { [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false))) }
+    if ($text.Trim() -eq '') { return (New-Object psobject) }
+    try { $data = ConvertFrom-Json -InputObject $text }
+    catch { throw ('{0} is not valid JSON ({1}). It was left unchanged.' -f $Path, $_.Exception.Message) }
+    if ($data -isnot [System.Management.Automation.PSCustomObject]) {
+        throw ('{0} does not contain a JSON object. It was left unchanged.' -f $Path)
+    }
+    return $data
+}
+
+function Save-JsonObject {
+    # Write next to the target, check that it parses back to the same data, then swap it in, so
+    # a failure can never leave a half-written settings file behind.
+    param([string]$Path, $Data)
+    $folder = Split-Path -Parent $Path
+    if ($folder) { New-Item -ItemType Directory -Force -Path $folder | Out-Null }
+    $temp = '{0}.tmp-{1}' -f $Path, [guid]::NewGuid().ToString('N').Substring(0, 8)
+    try {
+        [System.IO.File]::WriteAllText($temp, ((ConvertTo-JsonText $Data) + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        $roundTrip = Read-JsonObject $temp
+        $expected = ConvertTo-Json -Compress -Depth 100 -InputObject $Data
+        $actual = ConvertTo-Json -Compress -Depth 100 -InputObject $roundTrip
+        if ($expected -cne $actual) { throw 'The updated settings did not read back identically; nothing was changed.' }
+        try {
+            # [NullString]::Value, not $null: PowerShell turns $null into '' for string parameters,
+            # which File.Replace rejects as an illegal path.
+            Invoke-WithRetry {
+                if (Test-Path -LiteralPath $Path -PathType Leaf) { [System.IO.File]::Replace($temp, $Path, [NullString]::Value) }
+                else { [System.IO.File]::Move($temp, $Path) }
+            }
+        } catch {
+            throw ('Could not update {0} because another program keeps it open ({1}). Close Claude Desktop and run Setup again.' -f $Path, $_.Exception.Message.Trim())
+        }
+    } finally {
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Backup-ConfigFile {
+    param([string]$Path)
+    $root = $BackupDir
+    if (-not $root -and $env:LOCALAPPDATA) { $root = Join-Path $env:LOCALAPPDATA 'FreeCAD MCP\backup' }
+    if (-not $root) { return }
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $target = Join-Path $root ('claude_desktop_config-{0:yyyyMMdd-HHmmss}.json' -f (Get-Date))
+    Invoke-WithRetry { Copy-Item -LiteralPath $Path -Destination $target -Force }
+    Write-Log ('Backed up {0} to {1}' -f $Path, $target)
+}
+
+function Register-ClaudeDesktop {
+    $config = Find-ClaudeDesktopConfig
+    if (-not $config) {
+        Write-Log 'Claude Desktop settings were not found; skipping registration.'
+        Write-Result @{ claude_desktop_registered = 'no-claude-desktop' }
+        return
+    }
+    if (-not (Test-Path -LiteralPath $ServerExe -PathType Leaf)) { throw ('Server executable not found: {0}' -f $ServerExe) }
+    Write-Log ('Claude Desktop settings: {0}' -f $config)
+    $exists = Test-Path -LiteralPath $config -PathType Leaf
+    $data = $(if ($exists) { Read-JsonObject $config } else { New-Object psobject })
+
+    $property = $data.PSObject.Properties['mcpServers']
+    if ($property -and $null -ne $property.Value) {
+        if ($property.Value -isnot [System.Management.Automation.PSCustomObject]) {
+            throw ("'mcpServers' in {0} is not a JSON object. It was left unchanged." -f $config)
+        }
+        $servers = $property.Value
+    } else {
+        $servers = New-Object psobject
+        if ($property) { $property.Value = $servers }
+        else { Add-Member -InputObject $data -NotePropertyName 'mcpServers' -NotePropertyValue $servers }
+    }
+    if ($servers.PSObject.Properties[$script:ServerName]) {
+        # Do not overwrite a server the user configured (custom host, token, ...).
+        Write-Log "A Claude Desktop server named 'freecad' already exists; leaving it unchanged."
+        Write-Result @{ claude_desktop_registered = 'existing'; claude_desktop_config = $config }
+        return
+    }
+
+    $entry = [ordered]@{ command = $ServerExe }
+    if ($FreeCADCmd) { $entry['args'] = @('--freecadcmd', $FreeCADCmd) }
+    Add-Member -InputObject $servers -NotePropertyName $script:ServerName -NotePropertyValue $entry
+    if ($exists) { Backup-ConfigFile $config }
+    Save-JsonObject -Path $config -Data $data
+    Write-Log ("Added the 'freecad' server to {0}" -f $config)
+    Write-Result @{ claude_desktop_registered = 'added'; claude_desktop_config = $config }
+}
+
+function Unregister-ClaudeDesktop {
+    if (-not $ServerExe) { Write-Log 'No server path given; leaving Claude Desktop settings unchanged.'; return }
+    $configs = $(if ($DesktopConfig) { @($DesktopConfig) } else { @(Get-ClaudeDesktopConfigs) })
+    foreach ($config in $configs) {
+        try {
+            if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { continue }
+            $data = Read-JsonObject $config
+            $property = $data.PSObject.Properties['mcpServers']
+            if (-not $property -or $property.Value -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            $entry = $property.Value.PSObject.Properties[$script:ServerName]
+            if (-not $entry) { continue }
+            $command = ''
+            if ($entry.Value -is [System.Management.Automation.PSCustomObject] -and $entry.Value.PSObject.Properties['command']) {
+                $command = [string]$entry.Value.command
+            }
+            # Only remove the entry this installer created, not one the user pointed elsewhere.
+            if (-not [string]::Equals($command, $ServerExe, [StringComparison]::OrdinalIgnoreCase)) {
+                Write-Log ("The 'freecad' server in {0} was not added by this installer; leaving it." -f $config)
+                continue
+            }
+            Backup-ConfigFile $config
+            $property.Value.PSObject.Properties.Remove($script:ServerName)
+            Save-JsonObject -Path $config -Data $data
+            Write-Log ("Removed the 'freecad' server from {0}" -f $config)
+        } catch {
+            # Uninstalling must not fail because a settings file is unreadable.
+            Write-Log ('Could not update {0}: {1}' -f $config, $_.Exception.Message)
+        }
+    }
+}
+
 function Invoke-Uninstall {
+    # A running server would keep uv from removing its environment.
+    try { [void](Stop-ServerProcesses) } catch { Write-Log $_.Exception.Message }
     $uv = Find-Uv
     if ($uv) {
         Invoke-Logged -What 'uv tool uninstall freecad-mcp' -FilePath $uv.Path -TimeoutSec 120 -AllowFailure `
@@ -468,6 +884,7 @@ function Invoke-Uninstall {
                 -Arguments @('mcp', 'remove', '--scope', 'user', $script:ServerName) | Out-Null
         }
     }
+    Unregister-ClaudeDesktop
     if ($AddonDir -and (Test-Path -LiteralPath $AddonDir)) {
         if (Test-IsLink $AddonDir) { Write-Log ('{0} is a link; not removing it.' -f $AddonDir) }
         elseif (Test-Path -LiteralPath (Join-Path $AddonDir 'InitGui.py')) {
@@ -486,14 +903,19 @@ if ($LogFile) { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $L
 try {
     Write-Log ('== {0}' -f $Action)
     switch ($Action) {
-        'Check'              { Invoke-Check }
-        'InstallUv'          { Install-Uv }
-        'InstallPython'      { Install-Python }
-        'InstallFreeCAD'     { Install-FreeCAD }
-        'InstallServer'      { Install-Server }
-        'InstallAddon'       { Install-Addon }
-        'RegisterClaudeCode' { Register-ClaudeCode }
-        'Uninstall'          { Invoke-Uninstall }
+        'Check'                   { Invoke-Check }
+        'InstallUv'               { Install-Uv }
+        'InstallPython'           { Install-Python }
+        'InstallFreeCAD'          { Install-FreeCAD }
+        'InstallClaudeDesktop'    { Install-ClaudeDesktop }
+        'FindServerProcesses'     { Invoke-FindServerProcesses }
+        'StopServerProcesses'     { Invoke-StopServerProcesses }
+        'InstallServer'           { Install-Server }
+        'InstallAddon'            { Install-Addon }
+        'RegisterClaudeCode'      { Register-ClaudeCode }
+        'RegisterClaudeDesktop'   { Register-ClaudeDesktop }
+        'UnregisterClaudeDesktop' { Unregister-ClaudeDesktop }
+        'Uninstall'               { Invoke-Uninstall }
     }
     exit 0
 } catch {

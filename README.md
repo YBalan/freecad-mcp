@@ -33,8 +33,9 @@ FreeCAD MCP has two components: an addon running inside FreeCAD and an MCP serve
 launched by your client.
 
 On Windows, the [installer](docs/windows-installer.md) checks and installs uv,
-Python and FreeCAD, sets up both components and can register the server with
-Claude Code. A `.mcpb` bundle for Claude Desktop is built alongside it.
+Python, FreeCAD and Claude Desktop, sets up both components and can register the
+server with Claude Desktop and Claude Code. A `.mcpb` extension for Claude Desktop is built
+alongside it as an alternative.
 
 ### 1. Install and start the FreeCAD addon
 
@@ -74,7 +75,7 @@ default.
 | Guide | Contents |
 | --- | --- |
 | [Installation](docs/installation.md) | Addon directories, setup screenshots, running from source |
-| [Windows installer](docs/windows-installer.md) | One-click Windows setup, Claude Desktop bundle (.mcpb), Claude Code, building the artifacts |
+| [Windows installer](docs/windows-installer.md) | One-click Windows setup, Claude Desktop (installer option or .mcpb extension), Claude Code, building the artifacts |
 | [Configuration](docs/configuration.md) | Auto-start, text feedback, remote connections, HTTP transport |
 | [Docker](docs/docker.md) | Running the MCP server in a container, client setup, networking |
 | [Tools](docs/tools.md) | Available tools, screenshots, FEM analysis |
