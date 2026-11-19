@@ -5,10 +5,11 @@
 ; Per-user install, no administrator rights. The wizard checks uv, Python 3.12+ and
 ; FreeCAD and installs what is missing, installs the bundled MCP server wheel with
 ; `uv tool`, copies the addon into FreeCAD's Mod folder and can register the server
-; with Claude Code. All heavy lifting lives in freecad-mcp-setup.ps1.
+; with Claude Code and Claude Desktop. All heavy lifting lives in freecad-mcp-setup.ps1.
 ;
 ; Silent install: Setup.exe /VERYSILENT /SUPPRESSMSGBOXES [/MODDIR="<FreeCAD Mod folder>"]
-;                 [/INSTALLFREECAD=1] [/TASKS="!claudecode"]
+;                 [/INSTALLFREECAD=1] [/MERGETASKS="!claudecode,!claudedesktop"]
+; (/MERGETASKS keeps the other defaults; /TASKS would deselect every task it does not list.)
 
 #ifndef AppVersion
   #error AppVersion is not defined. Build with scripts/build_installers.py (it passes /DAppVersion=X.Y.Z).
@@ -59,6 +60,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "claudecode"; Description: "Add the FreeCAD MCP server to Claude Code (user scope)"; GroupDescription: "Claude integration:"; Check: ClaudeCodeInstalled
+Name: "claudedesktop"; Description: "Add the FreeCAD MCP server to Claude Desktop"; GroupDescription: "Claude integration:"; Check: ClaudeDesktopInstalled
 
 [Files]
 ; Installed copy: kept in {app} so the addon can be redeployed and the uninstaller has its helper.
@@ -78,7 +80,9 @@ Root: HKCU; Subkey: "Software\FreeCAD MCP"; ValueType: string; ValueName: "Versi
 Name: "{autoprograms}\{#AppName}\Add to Claude Desktop (.mcpb)"; Filename: "{app}\claude-desktop\FreeCAD-MCP.mcpb"
 
 [Run]
-Filename: "{app}\claude-desktop\FreeCAD-MCP.mcpb"; Description: "Add FreeCAD MCP to Claude Desktop now"; Flags: postinstall shellexec skipifsilent unchecked
+; Offered only when Setup did not already add the server to Claude Desktop: having both would
+; show two FreeCAD servers in Claude.
+Filename: "{app}\claude-desktop\FreeCAD-MCP.mcpb"; Description: "Add FreeCAD MCP to Claude Desktop now"; Flags: postinstall shellexec skipifsilent unchecked; Check: ExtensionOfferWanted
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\FreeCAD MCP\logs"
@@ -101,6 +105,8 @@ var
   ServerExe: String;
   AddonTarget: String;
   Problems: String;
+  DesktopNote: String;          { what happened with Claude Desktop, shown on the last page }
+  DesktopHandled: Boolean;      { the server is now in Claude Desktop's settings }
 
 { ---------- small helpers ---------- }
 
@@ -164,6 +170,27 @@ function ClaudeCodeInstalled: Boolean;
 begin
   Result := IsOnPath('claude.exe') or IsOnPath('claude.cmd') or
     FileExists(ExpandConstant('{%USERPROFILE}\.local\bin\claude.exe'));
+end;
+
+{ Claude Desktop keeps its profile in a different place depending on how it was installed
+  (Store build, older Store build, classic installer). The helper finds the exact file; this only
+  decides whether to offer the task, so it must not depend on the helper's check. }
+function ClaudeDesktopInstalled: Boolean;
+var
+  Found: TFindRec;
+begin
+  Result := DirExists(ExpandConstant('{localappdata}\Claude-Data')) or
+    DirExists(ExpandConstant('{userappdata}\Claude'));
+  if (not Result) and FindFirst(ExpandConstant('{localappdata}\Packages\Claude_*'), Found) then
+  begin
+    FindClose(Found);
+    Result := True;
+  end;
+end;
+
+function ExtensionOfferWanted: Boolean;
+begin
+  Result := not DesktopHandled;
 end;
 
 { Value of key in the helper's key=value result lines ('' when absent). }
@@ -346,7 +373,10 @@ begin
     begin
       Text := '{#AppName} {#AppVersion} is installed.' + #13#10#13#10 +
         'MCP server: ' + ServerExe + #13#10 +
-        'FreeCAD addon: ' + AddonTarget + #13#10#13#10 +
+        'FreeCAD addon: ' + AddonTarget + #13#10#13#10;
+      if DesktopNote <> '' then
+        Text := Text + DesktopNote + #13#10#13#10;
+      Text := Text +
         'Next: (re)start FreeCAD, choose the "MCP Addon" workbench and click "Start RPC Server" in the "FreeCAD MCP" toolbar.';
     end
     else
@@ -453,7 +483,7 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Args: String;
+  Args, Status: String;
 begin
   if CurStep <> ssPostInstall then
     Exit;
@@ -478,7 +508,32 @@ begin
       Problems := Problems + FailureText('Claude Code registration failed (the rest is installed)') + #13#10#13#10;
   end;
 
-  { The uninstaller reads these to undo the uv tool, the addon and the Claude Code entry. }
+  if WizardIsTaskSelected('claudedesktop') then
+  begin
+    Args := '-ServerExe "' + ServerExe + '" -BackupDir "' + ExpandConstant('{localappdata}\FreeCAD MCP\backup') + '"';
+    if FreeCADCmdPath <> '' then
+      Args := Args + ' -FreeCADCmd "' + FreeCADCmdPath + '"';
+    if RunHelper('RegisterClaudeDesktop', Args) then
+    begin
+      Status := InfoValue('claude_desktop_registered');
+      if Status = 'added' then
+      begin
+        DesktopHandled := True;
+        DesktopNote := 'Claude Desktop: the FreeCAD server was added to its settings. Quit Claude Desktop completely (tray icon, Quit) and open it again.';
+      end
+      else if Status = 'existing' then
+      begin
+        DesktopHandled := True;
+        DesktopNote := 'Claude Desktop: a "freecad" server is already configured there, so it was left unchanged.';
+      end
+      else
+        DesktopNote := 'Claude Desktop: its settings were not found, so nothing was added. Start Claude Desktop once, then use the Start menu shortcut "Add to Claude Desktop (.mcpb)".';
+    end
+    else
+      Problems := Problems + FailureText('Claude Desktop registration failed (the rest is installed)') + #13#10#13#10;
+  end;
+
+  { The uninstaller reads these to undo the uv tool, the addon and the Claude entries. }
   RegWriteStringValue(HKCU, RegKey, 'ServerExe', ServerExe);
   RegWriteStringValue(HKCU, RegKey, 'AddonDir', AddonTarget);
 end;

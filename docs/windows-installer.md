@@ -6,8 +6,8 @@ Two artifacts automate the setup described in the [installation guide](installat
 
 | Artifact | For | What it does |
 | --- | --- | --- |
-| `FreeCAD-MCP-Setup-<version>.exe` | Windows | Checks and installs uv, Python 3.12+ and FreeCAD, installs the MCP server and the FreeCAD addon, optionally registers the server with Claude Code. |
-| `freecad-mcp-<version>.mcpb` | Claude Desktop | One-click extension that runs the MCP server. It does not install FreeCAD or the addon. |
+| `FreeCAD-MCP-Setup-<version>.exe` | Windows | Checks and installs uv, Python 3.12+ and FreeCAD, installs the MCP server and the FreeCAD addon, optionally adds the server to Claude Desktop and Claude Code. |
+| `freecad-mcp-<version>.mcpb` | Claude Desktop | One-click extension that runs the MCP server, an alternative to the installer's Claude Desktop option. It does not install FreeCAD or the addon. |
 
 Both embed the wheel built from the same source tree as the addon, so the server
 and the addon always speak the same RPC protocol. Build them as described
@@ -31,41 +31,75 @@ permission itself). The wizard has these steps:
    (for example `%APPDATA%\FreeCAD\v1-1\Mod`), so the addon lands where the
    running installation loads it. Change it only for portable or custom profiles.
 3. **Install.** Setup installs the bundled `freecad-mcp` wheel with
-   `uv tool install`, verifies `freecad-mcp --help`, copies the addon to
-   `<Mod>\FreeCADMCP`, and, if you leave **Add the FreeCAD MCP server to Claude
-   Code** checked (shown only when Claude Code is found), runs
-   `claude mcp add --scope user freecad -- <freecad-mcp.exe> --freecadcmd <FreeCADCmd.exe>`.
+   `uv tool install`, verifies `freecad-mcp --help` and copies the addon to
+   `<Mod>\FreeCADMCP`. Under **Claude integration** it also offers, each only when
+   that app is found:
+   - **Add the FreeCAD MCP server to Claude Desktop**, see [below](#claude-desktop);
+   - **Add the FreeCAD MCP server to Claude Code**, which runs
+     `claude mcp add --scope user freecad -- <freecad-mcp.exe> --freecadcmd <FreeCADCmd.exe>`.
 
-An existing `freecad` server in Claude Code is left unchanged. An existing addon
-copy is moved to `%LOCALAPPDATA%\FreeCAD MCP\backup` (never inside `Mod`, where
-FreeCAD would load it as a second addon). Setup refuses to overwrite
+An existing `freecad` server in Claude Desktop or Claude Code is left unchanged. An
+existing addon copy is moved to `%LOCALAPPDATA%\FreeCAD MCP\backup` (never inside
+`Mod`, where FreeCAD would load it as a second addon). Setup refuses to overwrite
 `FreeCADMCP` if it is a link, such as a development checkout.
 
 Dependencies are downloaded, so an internet connection is required. After
 installing, restart FreeCAD, choose the **MCP Addon** workbench and click
 **Start RPC Server**.
 
+### Claude Desktop
+
+Setup adds a `freecad` entry to Claude Desktop's `claude_desktop_config.json` (the
+file behind **Settings → Developer → Edit Config**). The entry starts the installed
+`freecad-mcp.exe`, with `--freecadcmd` when FreeCAD was found, so Claude Desktop
+runs it as an ordinary MCP server. Setup:
+
+- looks where Claude Desktop keeps its settings, which depends on how it was
+  installed: `%LOCALAPPDATA%\Claude-Data\<package>` (current Microsoft Store build),
+  the older Store location inside `%LOCALAPPDATA%\Packages\Claude_*`, or
+  `%APPDATA%\Claude` (classic installer). If several exist, the most recently used
+  wins;
+- keeps every other setting as it is and saves a copy of the file to
+  `%LOCALAPPDATA%\FreeCAD MCP\backup` before changing it;
+- never touches a file it cannot parse, and never overwrites an existing `freecad`
+  entry (for example one with a custom host or token).
+
+Quit Claude Desktop completely (tray icon, **Quit**) and open it again; it reads the
+file only at startup. If Claude Desktop is installed but has never been started it
+has no settings yet, so Setup skips this step: start it once and run Setup again, or
+use the [extension](#claude-desktop-extension-mcpb) below.
+
 ### Silent install
 
 ```powershell
 .\FreeCAD-MCP-Setup-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES `
-    /MODDIR="C:\path\to\FreeCAD\Mod" /INSTALLFREECAD=1 /TASKS="!claudecode"
+    /MODDIR="C:\path\to\FreeCAD\Mod" /INSTALLFREECAD=1 /MERGETASKS="!claudecode"
 ```
 
 `/MODDIR` overrides the detected addon folder, `/INSTALLFREECAD=1` installs
 FreeCAD through winget when it is missing (off by default for silent installs),
-and `/TASKS="!claudecode"` skips the Claude Code registration. uv and Python are
-always installed when missing.
+and `/MERGETASKS="!claudecode"` skips the Claude Code registration; add
+`,!claudedesktop` to skip Claude Desktop too. A silent install registers with each
+Claude app it finds unless you opt out. Use `/MERGETASKS`, not `/TASKS`: `/TASKS`
+deselects every task it does not list. uv and Python are always installed when
+missing.
 
 ### Uninstall and logs
 
 Uninstall from **Settings → Apps**. It removes the app folder, the addon copy,
-the `freecad-mcp` uv tool and the Claude Code entry it created. uv, Python and
-FreeCAD are shared tools and stay installed. The setup log is
+the `freecad-mcp` uv tool and the Claude Desktop and Claude Code entries it
+created (an entry pointing somewhere else is yours and stays). uv, Python and
+FreeCAD are shared tools and stay installed, and the backups in
+`%LOCALAPPDATA%\FreeCAD MCP\backup` are kept. The setup log is
 `%LOCALAPPDATA%\FreeCAD MCP\logs\setup.log`; run the installer with `/LOG=<file>`
 for Inno Setup's own log.
 
-## Claude Desktop bundle (.mcpb)
+## Claude Desktop extension (.mcpb)
+
+An alternative to the installer's Claude Desktop option; use one or the other, not
+both, or Claude lists two FreeCAD servers (the finish page therefore offers the
+extension only when Setup did not add the server). Choose the extension when you
+want Claude Desktop's settings screen for the host, token and `FreeCADCmd` path.
 
 Open `freecad-mcp-<version>.mcpb` (or drag it into **Settings → Extensions**) in
 Claude Desktop. The installer also adds a Start menu shortcut for it. The bundle:

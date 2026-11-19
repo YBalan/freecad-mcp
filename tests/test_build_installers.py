@@ -228,3 +228,306 @@ def test_setup_helper_parses_in_windows_powershell() -> None:
         capture_output=True, text=True, timeout=60,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_installer_only_calls_helper_actions_that_exist() -> None:
+    inno = INNO.read_text(encoding="utf-8")
+    helper = HELPER.read_text(encoding="utf-8")
+    called = set(re.findall(r"RunHelper\('(\w+)'", inno)) | set(re.findall(r"HelperParams\([^,]+,\s*'(\w+)'", inno))
+    validate_set = re.search(r"ValidateSet\(([^)]*)\)", helper)
+    assert validate_set is not None
+    allowed = set(re.findall(r"'(\w+)'", validate_set.group(1)))
+    dispatched = set(re.findall(r"^\s*'(\w+)'\s*\{", helper, re.MULTILINE))
+    assert {"RegisterClaudeCode", "RegisterClaudeDesktop", "Uninstall"} <= called
+    assert called <= allowed
+    assert allowed == dispatched
+
+
+# --- Claude Desktop registration -----------------------------------------------------------------
+# These run the real helper under Windows PowerShell 5.1 (what the installer uses) against
+# sandboxed profile folders, so nothing touches the real Claude Desktop settings.
+
+windows_powershell = pytest.mark.skipif(
+    sys.platform != "win32" or shutil.which("powershell") is None, reason="needs Windows PowerShell 5.1"
+)
+
+SETTINGS = {
+    "mcpServers": {"other": {"command": "node", "args": ["a.js", "it's <b> & more"], "env": {"K": 'v "q" \\ x'}}},
+    "coworkUserFilesPath": "C:\\Users\\Someone\\Claude",
+    "preferences": {
+        "flag": True, "off": False, "n": 3, "big": 12345678901, "f": 1.5, "nothing": None,
+        "empty": [], "obj": {}, "list": [1, "two", [3], {"a": 4}],
+        "uni": "\u00e9\u4e2d\U0001F600", "ctl": "tab\there\nnew\u0001",
+    },
+}
+FREECADCMD = "C:\\Program Files\\FreeCAD 1.1\\bin\\FreeCADCmd.exe"
+
+
+def write_settings(path: Path, data: object) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def read_settings(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+class Helper:
+    """Runs freecad-mcp-setup.ps1 with a sandboxed home folder and a stand-in server executable."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.home = root / "home"
+        self.server = root / "freecad-mcp.exe"
+        self.server.write_bytes(b"")
+        self.backups = root / "backup"
+
+    def run(self, action: str, config: Path | None = None, *extra: str) -> tuple[int, dict[str, str]]:
+        result = self.root / "result.txt"
+        result.unlink(missing_ok=True)
+        command = [
+            shutil.which("powershell") or "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(HELPER), "-Action", action, "-ServerExe", str(self.server),
+            "-BackupDir", str(self.backups), "-ResultFile", str(result), "-LogFile", str(self.root / "log.txt"),
+        ]
+        if config is not None:
+            command += ["-DesktopConfig", str(config)]
+        environment = {
+            **os.environ,
+            "LOCALAPPDATA": str(self.home / "Local"), "APPDATA": str(self.home / "Roaming"), "USERPROFILE": str(self.home),
+        }
+        done = subprocess.run([*command, *extra], capture_output=True, text=True, timeout=120, env=environment)
+        values: dict[str, str] = {}
+        if result.exists():
+            for line in result.read_text(encoding="utf-8-sig").splitlines():
+                key, _, value = line.partition("=")
+                values[key] = value
+        return done.returncode, values
+
+    def backup_files(self) -> list[Path]:
+        return sorted(self.backups.glob("*.json")) if self.backups.exists() else []
+
+
+@pytest.fixture
+def helper(tmp_path: Path) -> Helper:
+    return Helper(tmp_path)
+
+
+@windows_powershell
+def test_desktop_registration_adds_the_server_and_keeps_everything_else(helper: Helper) -> None:
+    config = write_settings(helper.root / "claude_desktop_config.json", SETTINGS)
+    code, result = helper.run("RegisterClaudeDesktop", config, "-FreeCADCmd", FREECADCMD)
+    assert (code, result["claude_desktop_registered"]) == (0, "added")
+
+    after = read_settings(config)
+    assert after["mcpServers"].pop("freecad") == {"command": str(helper.server), "args": ["--freecadcmd", FREECADCMD]}
+    assert after == SETTINGS  # nothing else changed: unicode, escapes, empty and nested values
+    assert not config.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert not list(helper.root.glob("*.tmp-*"))
+    # The original is kept before the first change.
+    assert [read_settings(path) for path in helper.backup_files()] == [SETTINGS]
+
+    # Running Setup again changes nothing and makes no second backup.
+    before = config.read_bytes()
+    code, result = helper.run("RegisterClaudeDesktop", config)
+    assert (code, result["claude_desktop_registered"]) == (0, "existing")
+    assert config.read_bytes() == before
+    assert len(helper.backup_files()) == 1
+
+
+@windows_powershell
+def test_desktop_registration_without_freecadcmd_passes_no_arguments(helper: Helper) -> None:
+    config = write_settings(helper.root / "claude_desktop_config.json", {"mcpServers": {}})
+    assert helper.run("RegisterClaudeDesktop", config)[0] == 0
+    assert read_settings(config) == {"mcpServers": {"freecad": {"command": str(helper.server)}}}
+
+
+@windows_powershell
+def test_desktop_registration_leaves_a_users_own_entry_alone(helper: Helper) -> None:
+    mine = {"mcpServers": {"freecad": {"command": "uvx", "args": ["freecad-mcp", "--host", "10.0.0.5"]}}}
+    config = write_settings(helper.root / "claude_desktop_config.json", mine)
+    before = config.read_bytes()
+    code, result = helper.run("RegisterClaudeDesktop", config)
+    assert (code, result["claude_desktop_registered"]) == (0, "existing")
+    assert config.read_bytes() == before
+    assert helper.backup_files() == []
+
+
+@windows_powershell
+@pytest.mark.parametrize(
+    "content",
+    ["{ not json", "[1, 2]", "null", '{"mcpServers": [1]}'],
+    ids=["invalid-json", "array", "null", "servers-not-an-object"],
+)
+def test_desktop_registration_never_rewrites_settings_it_cannot_understand(helper: Helper, content: str) -> None:
+    config = helper.root / "claude_desktop_config.json"
+    config.write_text(content, encoding="utf-8")
+    code, result = helper.run("RegisterClaudeDesktop", config)
+    assert code == 1
+    assert "left unchanged" in result["error"]
+    assert config.read_text(encoding="utf-8") == content
+    assert not list(helper.root.glob("*.tmp-*"))
+
+
+@windows_powershell
+@pytest.mark.parametrize(
+    ("existing", "others"),
+    [
+        (None, {}),
+        ("", {}),
+        ("{}", {}),
+        ('{"preferences": {"a": 1}}', {"preferences": {"a": 1}}),
+        ('{"mcpServers": null, "keep": true}', {"keep": True}),
+    ],
+)
+def test_desktop_registration_creates_what_is_missing(helper: Helper, existing: str | None, others: dict) -> None:
+    config = helper.root / "profile" / "claude_desktop_config.json"
+    if existing is not None:
+        config.parent.mkdir()
+        config.write_text(existing, encoding="utf-8")
+    code, result = helper.run("RegisterClaudeDesktop", config)
+    assert (code, result["claude_desktop_registered"]) == (0, "added")
+    data = read_settings(config)
+    assert data.pop("mcpServers") == {"freecad": {"command": str(helper.server)}}
+    assert data == others
+
+
+class FileLock:
+    """Holds a file open for reading while forbidding writes and renames, like a virus scanner would."""
+
+    def __init__(self, path: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateFileW.restype = wintypes.HANDLE
+        self._kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        generic_read, share_read, open_existing, normal = 0x80000000, 0x1, 3, 0x80
+        self._handle = self._kernel32.CreateFileW(str(path), generic_read, share_read, None, open_existing, normal, None)
+        if self._handle in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_last_error(), f"cannot lock {path}")
+
+    def release(self) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+@windows_powershell
+def test_desktop_registration_waits_for_a_briefly_locked_settings_file(helper: Helper) -> None:
+    # Antivirus scanners and Claude Desktop itself hold the file for a moment; Setup must not fail.
+    import threading
+
+    config = write_settings(helper.root / "claude_desktop_config.json", SETTINGS)
+    lock = FileLock(config)
+    timer = threading.Timer(1.2, lock.release)
+    timer.start()
+    try:
+        code, result = helper.run("RegisterClaudeDesktop", config)
+    finally:
+        timer.cancel()
+        lock.release()
+    assert (code, result.get("claude_desktop_registered")) == (0, "added")
+    assert "freecad" in read_settings(config)["mcpServers"]
+
+
+@windows_powershell
+def test_desktop_registration_reports_a_settings_file_that_stays_locked(helper: Helper) -> None:
+    config = write_settings(helper.root / "claude_desktop_config.json", SETTINGS)
+    before = config.read_bytes()
+    lock = FileLock(config)
+    try:
+        code, result = helper.run("RegisterClaudeDesktop", config)
+    finally:
+        lock.release()
+    assert code == 1
+    assert "keeps it open" in result["error"] and "Close Claude Desktop" in result["error"]
+    assert config.read_bytes() == before
+    assert not list(helper.root.glob("*.tmp-*"))
+
+
+@windows_powershell
+def test_settings_are_not_swapped_in_when_they_would_not_read_back_identically(tmp_path: Path) -> None:
+    # Safety net behind the hand-written JSON writer: if it ever produced something that parses
+    # to different data, the file must stay as it was. A DateTime cannot round-trip through JSON.
+    target = write_settings(tmp_path / "claude_desktop_config.json", {"a": 1})
+    before = target.read_bytes()
+    script = f". '{HELPER}'; Save-JsonObject -Path '{target}' -Data ([ordered]@{{ when = [datetime]'2020-01-01' }})"
+    done = subprocess.run(
+        [shutil.which("powershell") or "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert done.returncode != 0
+    assert "did not read back identically" in done.stdout + done.stderr
+    assert target.read_bytes() == before
+    assert not list(tmp_path.glob("*.tmp-*"))
+
+
+@windows_powershell
+def test_desktop_unregistration_removes_only_the_entry_setup_added(helper: Helper) -> None:
+    config = write_settings(helper.root / "claude_desktop_config.json", SETTINGS)
+    helper.run("RegisterClaudeDesktop", config)
+    code, _ = helper.run("UnregisterClaudeDesktop", config)
+    assert code == 0
+    assert read_settings(config) == SETTINGS
+
+    # A 'freecad' server pointing somewhere else is the user's own and stays.
+    theirs = {"mcpServers": {"freecad": {"command": "C:\\tools\\freecad-mcp.exe"}, "other": {"command": "x"}}}
+    write_settings(config, theirs)
+    before = config.read_bytes()
+    assert helper.run("UnregisterClaudeDesktop", config)[0] == 0
+    assert config.read_bytes() == before
+
+
+@windows_powershell
+def test_desktop_unregistration_survives_unreadable_settings(helper: Helper) -> None:
+    config = helper.root / "claude_desktop_config.json"
+    config.write_text("{ broken", encoding="utf-8")
+    assert helper.run("UnregisterClaudeDesktop", config)[0] == 0  # uninstalling must not fail
+    assert config.read_text(encoding="utf-8") == "{ broken"
+
+
+@windows_powershell
+def test_desktop_settings_are_found_in_the_profile_claude_uses(helper: Helper) -> None:
+    local = helper.home / "Local"
+    # Nothing installed.
+    assert helper.run("RegisterClaudeDesktop") == (0, {"claude_desktop_registered": "no-claude-desktop"})
+
+    # The old package folder that Claude emptied when it moved its data must not get a config.
+    stale = local / "Packages" / "Claude_abc" / "LocalCache" / "Roaming" / "Claude"
+    stale.mkdir(parents=True)
+    (stale / ".user-data-left.claude_abc").write_text("", encoding="utf-8")
+    assert helper.run("RegisterClaudeDesktop")[1] == {"claude_desktop_registered": "no-claude-desktop"}
+    assert not (stale / "claude_desktop_config.json").exists()
+
+    # An initialised profile without a settings file yet gets one.
+    profile = local / "Claude-Data" / "claude_abc"
+    profile.mkdir(parents=True)
+    (profile / "config.json").write_text("{}", encoding="utf-8")
+    code, result = helper.run("RegisterClaudeDesktop")
+    assert (code, result["claude_desktop_registered"]) == (0, "added")
+    assert Path(result["claude_desktop_config"]) == profile / "claude_desktop_config.json"
+    assert read_settings(profile / "claude_desktop_config.json") == {"mcpServers": {"freecad": {"command": str(helper.server)}}}
+
+
+@windows_powershell
+def test_desktop_registration_prefers_the_most_recently_used_settings(helper: Helper) -> None:
+    older = write_settings(helper.home / "Roaming" / "Claude" / "claude_desktop_config.json", {"mcpServers": {}})
+    newer = write_settings(helper.home / "Local" / "Claude-Data" / "claude_abc" / "claude_desktop_config.json", {"mcpServers": {}})
+    os.utime(older, (1_600_000_000, 1_600_000_000))
+    os.utime(newer, (1_700_000_000, 1_700_000_000))
+    code, result = helper.run("RegisterClaudeDesktop")
+    assert code == 0 and Path(result["claude_desktop_config"]) == newer
+    assert "freecad" in read_settings(newer)["mcpServers"]
+    assert read_settings(older) == {"mcpServers": {}}
+
+    # Uninstalling looks in every known location.
+    write_settings(older, {"mcpServers": {"freecad": {"command": str(helper.server)}}})
+    assert helper.run("UnregisterClaudeDesktop")[0] == 0
+    assert read_settings(older) == {"mcpServers": {}}
+    assert read_settings(newer) == {"mcpServers": {}}
