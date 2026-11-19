@@ -7,12 +7,12 @@
     "url": "https://github.com/neka-nat/freecad-mcp",
     "source": "github"
   },
-  "version": "0.1.32",
+  "version": "0.1.33",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "freecad-mcp",
-      "version": "0.1.32",
+      "version": "0.1.33",
       "transport": {
         "type": "stdio"
       }
