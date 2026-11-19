@@ -61,7 +61,7 @@ def release_notes(version: str, tag: str, repo: str, assets: list[Path]) -> str:
         f"## FreeCAD MCP {version}\n\n"
         "| Download | Use |\n"
         "| --- | --- |\n"
-        f"| `{installer_filename(version)}` | Windows installer. Checks and installs uv, Python 3.12+ and FreeCAD, "
+        f"| `{installer_filename(version)}` | Windows installer. Checks and installs uv, Python 3.12+, FreeCAD and Claude Desktop, "
         "sets up the MCP server and the FreeCAD addon, and can add the server to Claude Desktop and Claude Code. "
         "No administrator rights needed. |\n"
         f"| `{mcpb_filename(version)}` | Claude Desktop extension that runs the MCP server, as an alternative to "

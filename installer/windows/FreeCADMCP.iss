@@ -1,14 +1,15 @@
-; FreeCAD MCP - Windows installer (Inno Setup 6.3+).
+; FreeCAD MCP - Windows installer (built and tested with Inno Setup 6.7.3).
 ; Build with:  uv run python scripts/build_installers.py windows
 ; The build script passes the version and the staged wheel/.mcpb through /D defines.
 ;
-; Per-user install, no administrator rights. The wizard checks uv, Python 3.12+ and
-; FreeCAD and installs what is missing, installs the bundled MCP server wheel with
+; Per-user install, no administrator rights. The wizard checks uv, Python 3.12+, FreeCAD
+; and Claude Desktop and installs what is missing, installs the bundled MCP server wheel with
 ; `uv tool`, copies the addon into FreeCAD's Mod folder and can register the server
-; with Claude Code and Claude Desktop. All heavy lifting lives in freecad-mcp-setup.ps1.
+; with Claude Code and Claude Desktop, and puts a copy of the Claude Desktop extension (.mcpb)
+; in the user's Downloads folder. All heavy lifting lives in freecad-mcp-setup.ps1.
 ;
 ; Silent install: Setup.exe /VERYSILENT /SUPPRESSMSGBOXES [/MODDIR="<FreeCAD Mod folder>"]
-;                 [/INSTALLFREECAD=1] [/MERGETASKS="!claudecode,!claudedesktop"]
+;                 [/INSTALLFREECAD=0] [/INSTALLCLAUDEDESKTOP=0] [/MERGETASKS="!claudecode,!claudedesktop"]
 ; (/MERGETASKS keeps the other defaults; /TASKS would deselect every task it does not list.)
 
 #ifndef AppVersion
@@ -107,6 +108,12 @@ var
   Problems: String;
   DesktopNote: String;          { what happened with Claude Desktop, shown on the last page }
   DesktopHandled: Boolean;      { the server is now in Claude Desktop's settings }
+  DesktopReady: Boolean;        { Claude Desktop has settings Setup can add the server to }
+  BundleCopy: String;           { where the .mcpb was copied for the user ('' if it could not be) }
+  BundleNote: String;           { why the copy failed, shown on the last page }
+  ServerStopped: Boolean;       { a running server was stopped so it could be updated }
+  NeedClaudeDesktop: Boolean;   { the Claude Desktop app is not installed }
+  InstallDesktopChosen: Boolean;
 
 { ---------- small helpers ---------- }
 
@@ -193,6 +200,79 @@ begin
   Result := not DesktopHandled;
 end;
 
+{ Replace %NAME% with the environment variable's value; unknown names are left as they are. }
+function ExpandEnvText(const Text: String): String;
+var
+  Rest, Name, Value: String;
+  P, Q: Integer;
+begin
+  Result := '';
+  Rest := Text;
+  while Rest <> '' do
+  begin
+    P := Pos('%', Rest);
+    if P = 0 then
+    begin
+      Result := Result + Rest;
+      Rest := '';
+    end
+    else
+    begin
+      Result := Result + Copy(Rest, 1, P - 1);
+      Delete(Rest, 1, P);
+      Q := Pos('%', Rest);
+      if Q = 0 then
+      begin
+        Result := Result + '%' + Rest;
+        Rest := '';
+      end
+      else
+      begin
+        Name := Copy(Rest, 1, Q - 1);
+        Delete(Rest, 1, Q);
+        Value := GetEnv(Name);
+        if Value = '' then
+          Result := Result + '%' + Name + '%'
+        else
+          Result := Result + Value;
+      end;
+    end;
+  end;
+end;
+
+{ The user's Downloads folder. People move it to another drive or into OneDrive, so ask Windows
+  (the "Downloads" known folder) instead of assuming %USERPROFILE%\Downloads. }
+function DownloadsDir: String;
+var
+  Raw: String;
+begin
+  Result := '';
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders',
+    '{374DE290-123F-4565-9164-39C4925E467B}', Raw) then
+    Result := RemoveBackslash(Trim(ExpandEnvText(Raw)));
+  if (Result = '') or (Pos('%', Result) > 0) then
+    Result := ExpandConstant('{%USERPROFILE}\Downloads');
+end;
+
+{ A convenience copy of the Claude Desktop extension. Failing to make it must never fail Setup. }
+procedure CopyBundleToDownloads;
+var
+  Dir, Target: String;
+begin
+  BundleCopy := '';
+  Dir := DownloadsDir;
+  Target := AddBackslash(Dir) + '{#McpbFile}';
+  if ForceDirectories(Dir) and CopyFile(ExpandConstant('{app}\claude-desktop\FreeCAD-MCP.mcpb'), Target, False) then
+  begin
+    BundleCopy := Target;
+    { The uninstaller removes the copy again. }
+    RegWriteStringValue(HKCU, RegKey, 'BundleCopy', Target);
+  end
+  else
+    BundleNote := 'The Claude Desktop extension could not be copied to ' + Dir + '. It is in ' +
+      ExpandConstant('{app}\claude-desktop') + '.';
+end;
+
 { Value of key in the helper's key=value result lines ('' when absent). }
 function InfoValue(const Key: String): String;
 var
@@ -251,6 +331,8 @@ begin
   NeedPython := InfoValue('python_status') <> 'found';
   NeedFreeCAD := InfoValue('freecad_status') <> 'found';
   HaveWinget := InfoValue('winget_status') = 'found';
+  DesktopReady := InfoValue('claude_desktop_status') = 'found';
+  NeedClaudeDesktop := InfoValue('claude_desktop_app') = 'missing';
   FreeCADCmdPath := InfoValue('freecad_cmd');
   Suggested := InfoValue('mod_dir');
 
@@ -299,6 +381,38 @@ begin
     CheckPage.CheckListBox.ItemEnabled[2] := False;
   end;
 
+  { Claude Desktop is installed for the user when it is missing; Claude Code is only detected. }
+  CheckPage.Values[3] := False;
+  CheckPage.CheckListBox.ItemEnabled[3] := False;
+  if NeedClaudeDesktop then
+  begin
+    if HaveWinget then
+    begin
+      CheckPage.CheckListBox.ItemCaption[3] := '[Missing]  Claude Desktop - install it now with winget';
+      CheckPage.Values[3] := True;
+      CheckPage.CheckListBox.ItemEnabled[3] := True;
+    end
+    else
+      CheckPage.CheckListBox.ItemCaption[3] := '[Not found]  Claude Desktop - get it from claude.ai/download (winget is not available)';
+  end
+  else if (InfoValue('claude_desktop_app') = 'found') or
+    ((InfoValue('claude_desktop_app') = '') and ClaudeDesktopInstalled) then
+  begin
+    if DesktopReady then
+      CheckPage.CheckListBox.ItemCaption[3] := '[OK]  Claude Desktop is installed - Setup can add the FreeCAD server to it'
+    else
+      CheckPage.CheckListBox.ItemCaption[3] := '[OK]  Claude Desktop is installed (start it once so the server can be added)';
+  end
+  else
+    CheckPage.CheckListBox.ItemCaption[3] := '[Not found]  Claude Desktop - get it from claude.ai/download';
+
+  if ClaudeCodeInstalled then
+    CheckPage.CheckListBox.ItemCaption[4] := '[OK]  Claude Code is installed - Setup can add the FreeCAD server to it'
+  else
+    CheckPage.CheckListBox.ItemCaption[4] := '[Not found]  Claude Code - optional';
+  CheckPage.Values[4] := False;
+  CheckPage.CheckListBox.ItemEnabled[4] := False;
+
   if InfoValue('freecad_running') = '1' then
     CheckPage.Description := 'FreeCAD is running. Restart it after Setup finishes so it loads the addon.'
   else
@@ -325,10 +439,12 @@ begin
   HelperPath := ExpandConstant('{tmp}\{#Helper}');
 
   CheckPage := CreateInputOptionPage(wpWelcome, 'Requirements',
-    'Checking this computer...', 'FreeCAD MCP needs uv, Python 3.12 or newer, and FreeCAD. Items marked [Missing] are installed for you.', False, False);
+    'Checking this computer...', 'FreeCAD MCP needs uv, Python 3.12 or newer, and FreeCAD, and works with Claude Desktop and Claude Code. Items marked [Missing] are installed for you; Claude Code is optional. Setup adds the server to the Claude apps it finds.', False, False);
   CheckPage.Add('uv');
   CheckPage.Add('Python');
   CheckPage.Add('FreeCAD');
+  CheckPage.Add('Claude Desktop');
+  CheckPage.Add('Claude Code');
 
   AddonPage := CreateInputDirPage(CheckPage.ID, 'FreeCAD addon folder',
     'Where should the FreeCAD MCP addon go?',
@@ -376,6 +492,13 @@ begin
         'FreeCAD addon: ' + AddonTarget + #13#10#13#10;
       if DesktopNote <> '' then
         Text := Text + DesktopNote + #13#10#13#10;
+      if ServerStopped then
+        Text := Text + 'The running FreeCAD MCP server was stopped so it could be updated. Restart Claude Desktop, or reconnect with /mcp in Claude Code, to start the new version.' + #13#10#13#10;
+      if BundleCopy <> '' then
+        Text := Text + 'Claude Desktop extension (.mcpb): copied to ' + BundleCopy +
+          '. Open it to install the extension instead of the server entry.' + #13#10#13#10
+      else if BundleNote <> '' then
+        Text := Text + BundleNote + #13#10#13#10;
       Text := Text +
         'Next: (re)start FreeCAD, choose the "MCP Addon" workbench and click "Start RPC Server" in the "FreeCAD MCP" toolbar.';
     end
@@ -396,6 +519,7 @@ begin
   if CurPageID = CheckPage.ID then
   begin
     InstallFreeCADChosen := CheckPage.Values[2];
+    InstallDesktopChosen := CheckPage.Values[3] and NeedClaudeDesktop;
     if NeedFreeCAD and (not InstallFreeCADChosen) then
       Result := SuppressibleMsgBox('FreeCAD was not found and will not be installed now.' + #13#10 +
         'Setup can still copy the addon and the MCP server; install FreeCAD later.' + #13#10#13#10 +
@@ -422,13 +546,19 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Progress: TOutputMarqueeProgressWizardPage;
+  Owners: String;
 begin
   Result := '';
   Problems := '';
   EnsureChecked;
   { Silent installs never show the page, so read the options from the command line. }
+  DesktopNote := '';
   if WizardSilent then
-    InstallFreeCADChosen := (ExpandConstant('{param:INSTALLFREECAD|0}') = '1') and NeedFreeCAD and HaveWinget;
+  begin
+    { FreeCAD and Claude Desktop are installed by default; /INSTALLFREECAD=0 and /INSTALLCLAUDEDESKTOP=0 opt out. }
+    InstallFreeCADChosen := (ExpandConstant('{param:INSTALLFREECAD|1}') = '1') and NeedFreeCAD and HaveWinget;
+    InstallDesktopChosen := (ExpandConstant('{param:INSTALLCLAUDEDESKTOP|1}') = '1') and NeedClaudeDesktop and HaveWinget;
+  end;
 
   ExtractTemporaryFile('{#WheelFile}');
   Progress := CreateOutputMarqueeProgressPage('Installing requirements',
@@ -469,6 +599,44 @@ begin
       EnsureChecked;
     end;
 
+    { Claude Desktop is optional for the server, so failing to install it must not stop Setup. }
+    DesktopHandled := False;
+    if NeedClaudeDesktop and InstallDesktopChosen then
+    begin
+      Progress.SetText('Installing Claude Desktop with winget...', 'This can take a few minutes.');
+      if RunHelper('InstallClaudeDesktop', '') then
+        DesktopNote := 'Claude Desktop was installed. Start it and sign in once, then add the FreeCAD server with the extension (.mcpb) or by running Setup again.'
+      else
+        DesktopNote := 'Claude Desktop could not be installed (details in ' + LogFile + '). Get it from claude.ai/download.';
+    end;
+
+    { A server that Claude (or another client) has started keeps files open, and Windows will
+      not let uv replace them. Stop it, with the user's permission. }
+    ServerStopped := False;
+    if RunHelper('FindServerProcesses', '') and (InfoValue('server_processes') <> '') and
+      (InfoValue('server_processes') <> '0') then
+    begin
+      Owners := InfoValue('server_process_owners');
+      if Owners = '' then
+        Owners := 'another program';
+      if not WizardSilent then
+        if SuppressibleMsgBox('The FreeCAD MCP server is running right now (started by ' + Owners +
+          '), so Setup cannot update it.' + #13#10#13#10 +
+          'Setup can stop it. Afterwards, restart Claude Desktop or, in Claude Code, reconnect with /mcp to start the new version.' + #13#10#13#10 +
+          'Stop the running server now?', mbConfirmation, MB_YESNO, IDYES) <> IDYES then
+        begin
+          Result := 'The FreeCAD MCP server is still running. Close the programs that use it (Claude Desktop, Claude Code, a terminal), then click Back and Next.';
+          Exit;
+        end;
+      Progress.SetText('Stopping the running FreeCAD MCP server...', '');
+      if not RunHelper('StopServerProcesses', '') then
+      begin
+        Result := FailureText('Could not stop the running FreeCAD MCP server');
+        Exit;
+      end;
+      ServerStopped := True;
+    end;
+
     Progress.SetText('Installing the FreeCAD MCP server...', 'Downloading its dependencies with uv.');
     if not RunHelper('InstallServer', '-WheelPath "' + ExpandConstant('{tmp}\{#WheelFile}') + '"') then
     begin
@@ -487,6 +655,8 @@ var
 begin
   if CurStep <> ssPostInstall then
     Exit;
+
+  CopyBundleToDownloads;
 
   { Addon: copied by the helper (not [Files]) so it can back up an old copy and refuse links. }
   Args := '-AddonSource "' + ExpandConstant('{app}\addon\FreeCADMCP') + '" -ModDir "' +
@@ -542,11 +712,14 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
-  Script, Args, Addon, Server: String;
+  Script, Args, Addon, Server, Bundle: String;
   ResultCode: Integer;
 begin
   if CurUninstallStep <> usUninstall then
     Exit;
+  { The copy of the extension that Setup put in the Downloads folder. }
+  if RegQueryStringValue(HKCU, RegKey, 'BundleCopy', Bundle) and (Bundle <> '') then
+    DeleteFile(Bundle);
   Script := ExpandConstant('{app}\scripts\{#Helper}');
   if not FileExists(Script) then
     Exit;

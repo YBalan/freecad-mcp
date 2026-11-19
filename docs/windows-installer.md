@@ -6,7 +6,7 @@ Two artifacts automate the setup described in the [installation guide](installat
 
 | Artifact | For | What it does |
 | --- | --- | --- |
-| `FreeCAD-MCP-Setup-<version>.exe` | Windows | Checks and installs uv, Python 3.12+ and FreeCAD, installs the MCP server and the FreeCAD addon, optionally adds the server to Claude Desktop and Claude Code. |
+| `FreeCAD-MCP-Setup-<version>.exe` | Windows | Checks and installs uv, Python 3.12+, FreeCAD and Claude Desktop, installs the MCP server and the FreeCAD addon, optionally adds the server to Claude Desktop and Claude Code. |
 | `freecad-mcp-<version>.mcpb` | Claude Desktop | One-click extension that runs the MCP server, an alternative to the installer's Claude Desktop option. It does not install FreeCAD or the addon. |
 
 Both embed the wheel built from the same source tree as the addon, so the server
@@ -25,7 +25,19 @@ permission itself). The wizard has these steps:
    | --- | --- | --- |
    | uv | `PATH`, then the usual uv install folders | Installed with the [official uv installer](https://docs.astral.sh/uv/getting-started/installation/); winget (`astral-sh.uv`) is the fallback. |
    | Python 3.12 or newer | uv, the `py` launcher, `PATH` (the Microsoft Store stub is ignored) | `uv python install 3.12`, a per-user copy managed by uv. |
-   | FreeCAD | Windows uninstall entries, Program Files, `PATH` | Optional checkbox: `winget install FreeCAD.FreeCAD`. Without winget, install it from [freecad.org](https://www.freecad.org/downloads.php); Setup still copies the addon. |
+   | FreeCAD | Windows uninstall entries, Program Files, `PATH` | Checked by default: `winget install FreeCAD.FreeCAD` (Windows asks for permission). Untick it to skip. If the install fails, Setup stops. Without winget, install it from [freecad.org](https://www.freecad.org/downloads.php); Setup still copies the addon. |
+   | Claude Desktop | The Microsoft Store package, the classic install folders and its uninstall entry (settings left behind by an uninstalled copy do not count) | Checked by default: `winget install Anthropic.Claude`. Untick it to skip. Without winget, get it from [claude.ai/download](https://claude.ai/download). |
+   | Claude Code (optional) | `PATH`, `~\.local\bin` | Shown as `[Not found]`. Setup does not install it. |
+
+   Claude Desktop is installed so the server has a client; a failed install does not
+   stop Setup, which then points you to claude.ai/download. winget's package is
+   Anthropic's standard installer and can be an older version than the Microsoft
+   Store build. A freshly installed Claude Desktop has no settings until it has
+   run once, so Setup cannot add the server to it in the same run: start it and sign
+   in, then open the [extension](#claude-desktop-extension-mcpb) (a copy is placed in
+   your Downloads folder) or run Setup again. Claude Code is only detected; Setup
+   adds the server to whichever Claude apps it finds (see **Claude integration**
+   below).
 
 2. **FreeCAD addon folder.** Setup asks FreeCAD itself where its `Mod` folder is
    (for example `%APPDATA%\FreeCAD\v1-1\Mod`), so the addon lands where the
@@ -46,6 +58,15 @@ existing addon copy is moved to `%LOCALAPPDATA%\FreeCAD MCP\backup` (never insid
 Dependencies are downloaded, so an internet connection is required. After
 installing, restart FreeCAD, choose the **MCP Addon** workbench and click
 **Start RPC Server**.
+
+**Updating while Claude is open.** Claude Desktop and Claude Code start the server
+(`freecad-mcp.exe`) and keep it running, and Windows does not let `uv` replace files
+a running program has open (`failed to remove directory ... Access is denied`).
+When Setup finds the server running it names the program that started it and asks to
+stop it. Afterwards restart Claude Desktop, or reconnect with `/mcp` in Claude Code.
+Silent installs and the uninstaller stop it without asking. Only processes running
+from the `freecad-mcp` uv tool are stopped, never other programs. If you answer No,
+close Claude and any terminal running `freecad-mcp`, then click **Back** and **Next**.
 
 ### Claude Desktop
 
@@ -76,10 +97,13 @@ use the [extension](#claude-desktop-extension-mcpb) below.
     /MODDIR="C:\path\to\FreeCAD\Mod" /INSTALLFREECAD=1 /MERGETASKS="!claudecode"
 ```
 
-`/MODDIR` overrides the detected addon folder, `/INSTALLFREECAD=1` installs
-FreeCAD through winget when it is missing (off by default for silent installs),
-and `/MERGETASKS="!claudecode"` skips the Claude Code registration; add
-`,!claudedesktop` to skip Claude Desktop too. A silent install registers with each
+`/MODDIR` overrides the detected addon folder. FreeCAD and Claude Desktop are
+installed through winget when missing, also in silent installs; `/INSTALLFREECAD=0`
+and `/INSTALLCLAUDEDESKTOP=0` opt out. FreeCAD's installer asks Windows for
+permission, so an unattended run with nobody at the desktop should pass
+`/INSTALLFREECAD=0` and install FreeCAD beforehand. `/MERGETASKS="!claudecode"`
+skips the Claude Code registration; add `,!claudedesktop` to skip the Claude
+Desktop registration too. A silent install registers with each
 Claude app it finds unless you opt out. Use `/MERGETASKS`, not `/TASKS`: `/TASKS`
 deselects every task it does not list. uv and Python are always installed when
 missing.
@@ -102,7 +126,10 @@ extension only when Setup did not add the server). Choose the extension when you
 want Claude Desktop's settings screen for the host, token and `FreeCADCmd` path.
 
 Open `freecad-mcp-<version>.mcpb` (or drag it into **Settings → Extensions**) in
-Claude Desktop. The installer also adds a Start menu shortcut for it. The bundle:
+Claude Desktop. The installer puts a copy of it in your Downloads folder (wherever
+Windows has it, for example `D:\Downloads`; the uninstaller removes that copy) and
+adds a Start menu shortcut. If the copy cannot be made, Setup still succeeds and
+the file stays in its app folder. The bundle:
 
 - needs [uv](https://docs.astral.sh/uv/) on the computer (the Windows installer
   provides it); uv fetches Python 3.12+ and the server's dependencies itself;

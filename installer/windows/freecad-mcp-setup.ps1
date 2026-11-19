@@ -16,6 +16,9 @@
     InstallUv                Install uv for the current user (astral.sh installer, winget fallback).
     InstallPython            Install Python 3.12 through uv.
     InstallFreeCAD           Install FreeCAD through winget (FreeCAD's installer asks for elevation).
+    InstallClaudeDesktop     Install Claude Desktop through winget when the app is missing.
+    FindServerProcesses      Report running freecad-mcp servers (started by Claude and the like).
+    StopServerProcesses      Stop them; Windows will not let uv replace files they have open.
     InstallServer            uv tool install the bundled freecad-mcp wheel.
     InstallAddon             Copy the addon to <ModDir>\FreeCADMCP, backing up a previous copy.
     RegisterClaudeCode       claude mcp add the server (user scope) unless a 'freecad' server exists.
@@ -25,7 +28,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('', 'Check', 'InstallUv', 'InstallPython', 'InstallFreeCAD', 'InstallServer', 'InstallAddon', 'RegisterClaudeCode', 'RegisterClaudeDesktop', 'UnregisterClaudeDesktop', 'Uninstall')]
+    [ValidateSet('', 'Check', 'InstallUv', 'InstallPython', 'InstallFreeCAD', 'InstallClaudeDesktop', 'FindServerProcesses', 'StopServerProcesses', 'InstallServer', 'InstallAddon', 'RegisterClaudeCode', 'RegisterClaudeDesktop', 'UnregisterClaudeDesktop', 'Uninstall')]
     [string]$Action = '',
     [string]$ResultFile = '',
     [string]$LogFile = '',
@@ -36,7 +39,11 @@ param(
     [string]$AddonDir = '',
     [string]$ServerExe = '',
     [string]$FreeCADCmd = '',
-    [string]$DesktopConfig = ''
+    [string]$DesktopConfig = '',
+    # Test seams: a stand-in winget, and the name of the Claude Desktop Store package to look for.
+    [string]$WingetPath = '',
+    [string]$ClaudeDesktopPackage = 'Claude',
+    [switch]$IgnoreUninstallEntries
 )
 
 $ErrorActionPreference = 'Stop'
@@ -220,6 +227,7 @@ function Get-InstalledFreeCADRoots {
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     )
+    if ($IgnoreUninstallEntries) { $uninstallKeys = @() }
     foreach ($key in $uninstallKeys) {
         foreach ($item in (Get-ChildItem -Path $key -ErrorAction SilentlyContinue)) {
             $props = Get-ItemProperty -LiteralPath $item.PSPath -ErrorAction SilentlyContinue
@@ -292,6 +300,10 @@ function Find-Claude {
 }
 
 function Find-Winget {
+    if ($WingetPath) {
+        if (Test-Path -LiteralPath $WingetPath -PathType Leaf) { return $WingetPath }
+        return $null
+    }
     $command = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) { return $command.Source }
     return $null
@@ -323,6 +335,7 @@ function Invoke-Check {
     Write-Log ('freecad: {0}; addon folder: {1}' -f $values.freecad_status, $values.mod_dir)
 
     $values.winget_status = $(if (Find-Winget) { 'found' } else { 'missing' })
+    $values.claude_desktop_app = $(if (Test-ClaudeDesktopApp) { 'found' } else { 'missing' })
     $claude = Find-Claude
     $values.claude_status = $(if ($claude) { 'found' } else { 'missing' })
     $desktop = Find-ClaudeDesktopConfig
@@ -382,19 +395,171 @@ function Install-FreeCAD {
     }
     Write-Log 'Installing FreeCAD with winget (a Windows elevation prompt may appear; this can take several minutes).'
     Invoke-Logged -What 'winget install FreeCAD.FreeCAD' -FilePath $winget -TimeoutSec 1800 -AllowFailure `
-        -Arguments @('install', '--id', 'FreeCAD.FreeCAD', '--exact', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') | Out-Null
+        -Arguments @('install', '--id', 'FreeCAD.FreeCAD', '--exact', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity') | Out-Null
     if (-not (Find-FreeCAD)) {
         throw 'FreeCAD was not installed (the elevation prompt may have been declined). Install it from https://www.freecad.org/downloads.php and run this installer again.'
     }
     Write-Log 'FreeCAD installed.'
 }
 
+# ---------------------------------------------------------------- running servers
+
+function Get-UvPath {
+    # First line of `uv <args>` that looks like a Windows path, or ''.
+    param([string[]]$Arguments)
+    $uv = Find-Uv
+    if (-not $uv) { return '' }
+    try {
+        $result = Invoke-Native -FilePath $uv.Path -Arguments $Arguments -TimeoutSec 30
+        if ($result.ExitCode -eq 0) {
+            $line = $result.Output -split "\r?\n" | Where-Object { $_ -match '^\s*[A-Za-z]:\\' } | Select-Object -First 1
+            if ($line) { return $line.Trim() }
+        }
+    } catch { }
+    return ''
+}
+
+function Get-ServerProcesses {
+    # Processes running from the installed server: python.exe inside its uv tool environment
+    # and the freecad-mcp.exe launcher. A client such as Claude starts these and keeps them
+    # running, and Windows will not let uv delete or replace files a running program has open.
+    if ($null -eq $script:ToolDir) {
+        $script:ToolDir = $(if ($env:UV_TOOL_DIR) { $env:UV_TOOL_DIR } else { Get-UvPath @('tool', 'dir') })
+        if (-not $script:ToolDir -and $env:APPDATA) { $script:ToolDir = Join-Path $env:APPDATA 'uv\tools' }
+        $script:BinDir = $(if ($env:UV_TOOL_BIN_DIR) { $env:UV_TOOL_BIN_DIR } else { Get-UvPath @('tool', 'dir', '--bin') })
+        if (-not $script:BinDir -and $env:USERPROFILE) { $script:BinDir = Join-Path $env:USERPROFILE '.local\bin' }
+    }
+    $prefix = $(if ($script:ToolDir) { (Join-Path $script:ToolDir 'freecad-mcp').TrimEnd('\') + '\' } else { '' })
+    $launchers = @()
+    if ($script:BinDir) { $launchers += (Join-Path $script:BinDir 'freecad-mcp.exe') }
+    if ($ServerExe) { $launchers += $ServerExe }
+    $found = @()
+    foreach ($process in @(Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $path = $process.ExecutablePath
+        if (-not $path) { continue }
+        $hit = [bool]($prefix -and $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase))
+        foreach ($launcher in $launchers) {
+            if ([string]::Equals($path, $launcher, [StringComparison]::OrdinalIgnoreCase)) { $hit = $true }
+        }
+        if ($hit) { $found += $process }
+    }
+    return $found
+}
+
+function Get-ProcessOwners {
+    # Names of the programs that started the given processes (the parents outside the group).
+    param($Processes)
+    $ids = @($Processes | ForEach-Object { $_.ProcessId })
+    $names = @()
+    foreach ($process in $Processes) {
+        if ($ids -contains $process.ParentProcessId) { continue }
+        $parent = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId={0}' -f $process.ParentProcessId) -ErrorAction SilentlyContinue
+        if ($parent -and $parent.Name) { $names += $parent.Name }
+    }
+    return @($names | Select-Object -Unique)
+}
+
+function Stop-ServerProcesses {
+    # Returns how many processes were stopped. Throws if some survive.
+    $found = @(Get-ServerProcesses)
+    if ($found.Count -eq 0) { return 0 }
+    foreach ($process in $found) {
+        try {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+            Write-Log ('Stopped {0} (pid {1})' -f $process.Name, $process.ProcessId)
+        } catch {
+            # A child usually exits together with its parent, so it may already be gone.
+            if (Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue) {
+                Write-Log ('Could not stop {0} (pid {1}): {2}' -f $process.Name, $process.ProcessId, $_.Exception.Message)
+            }
+        }
+    }
+    # Windows keeps the files locked until the processes have really gone.
+    $deadline = (Get-Date).AddSeconds(15)
+    do { Start-Sleep -Milliseconds 250; $left = @(Get-ServerProcesses) } while ($left.Count -gt 0 -and (Get-Date) -lt $deadline)
+    if ($left.Count -gt 0) {
+        throw ('The FreeCAD MCP server is still running (process {0}). Close the program that started it and try again.' -f (($left | ForEach-Object { $_.ProcessId }) -join ', '))
+    }
+    return $found.Count
+}
+
+function Invoke-FindServerProcesses {
+    $found = @(Get-ServerProcesses)
+    $owners = @(Get-ProcessOwners $found)
+    Write-Log ('{0} FreeCAD MCP server process(es) running; started by: {1}' -f $found.Count, ($owners -join ', '))
+    Write-Result @{
+        server_processes = $found.Count
+        server_process_ids = (($found | ForEach-Object { $_.ProcessId }) -join ',')
+        server_process_owners = ($owners -join ', ')
+    }
+}
+
+function Invoke-StopServerProcesses {
+    $count = Stop-ServerProcesses
+    Write-Result @{ server_processes_stopped = $count }
+}
+
+function Test-ClaudeDesktopApp {
+    # True when the Claude Desktop application itself is installed. Leftover data folders do not
+    # count: Claude keeps its settings after an uninstall.
+    try { if (Get-AppxPackage -Name $ClaudeDesktopPackage -ErrorAction Stop) { return $true } } catch { }
+    $programs = @()
+    if ($env:LOCALAPPDATA) {
+        $programs += (Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe')
+        $programs += (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe')
+    }
+    if ($env:ProgramFiles) { $programs += (Join-Path $env:ProgramFiles 'Claude\Claude.exe') }
+    foreach ($program in $programs) {
+        if (Test-Path -LiteralPath $program -PathType Leaf) { return $true }
+    }
+    $uninstallKeys = @(
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    if ($IgnoreUninstallEntries) { $uninstallKeys = @() }
+    foreach ($key in $uninstallKeys) {
+        foreach ($item in (Get-ChildItem -Path $key -ErrorAction SilentlyContinue)) {
+            $props = Get-ItemProperty -LiteralPath $item.PSPath -ErrorAction SilentlyContinue
+            if ($props -and $props.DisplayName -eq 'Claude' -and $props.Publisher -like 'Anthropic*') { return $true }
+        }
+    }
+    return $false
+}
+
+function Install-ClaudeDesktop {
+    if (Test-ClaudeDesktopApp) {
+        Write-Log 'Claude Desktop is already installed.'
+        Write-Result @{ claude_desktop_installed = 'already' }
+        return
+    }
+    $winget = Find-Winget
+    if (-not $winget) { throw 'winget is not available. Install Claude Desktop from https://claude.ai/download.' }
+    Write-Log 'Installing Claude Desktop with winget (this can take a few minutes).'
+    $result = Invoke-Logged -What 'winget install Anthropic.Claude' -FilePath $winget -TimeoutSec 1800 -AllowFailure `
+        -Arguments @('install', '--id', 'Anthropic.Claude', '--exact', '--source', 'winget', '--silent', '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity')
+    # A non-zero code can still mean "already there"; trust what is on the computer afterwards.
+    if ($result.ExitCode -ne 0 -and -not (Test-ClaudeDesktopApp)) {
+        throw ('Claude Desktop was not installed (winget exit code {0}). Install it from https://claude.ai/download.' -f $result.ExitCode)
+    }
+    Write-Log 'Claude Desktop installed.'
+    Write-Result @{ claude_desktop_installed = 'installed' }
+}
+
 function Install-Server {
     $uv = Find-Uv
     if (-not $uv) { throw 'uv was not found.' }
     if (-not (Test-Path -LiteralPath $WheelPath -PathType Leaf)) { throw ('Wheel not found: {0}' -f $WheelPath) }
-    Invoke-Logged -What 'uv tool install freecad-mcp' -FilePath $uv.Path -TimeoutSec 900 `
-        -Arguments @('tool', 'install', '--force', '--reinstall-package', 'freecad-mcp', '--python', $script:PythonRequest, $WheelPath) | Out-Null
+    try {
+        Invoke-Logged -What 'uv tool install freecad-mcp' -FilePath $uv.Path -TimeoutSec 900 `
+            -Arguments @('tool', 'install', '--force', '--reinstall-package', 'freecad-mcp', '--python', $script:PythonRequest, $WheelPath) | Out-Null
+    } catch {
+        $message = $_.Exception.Message
+        if ($message -match 'Access is denied|os error 5|os error 32|being used by another process') {
+            throw ('Setup could not replace the installed FreeCAD MCP server because a program is using it. Close Claude Desktop, Claude Code and any terminal running freecad-mcp, then run Setup again. ({0})' -f $message)
+        }
+        throw
+    }
     $bin = (Invoke-Logged -What 'uv tool dir --bin' -FilePath $uv.Path -TimeoutSec 60 -Arguments @('tool', 'dir', '--bin')).Output.Trim()
     $exe = Join-Path $bin 'freecad-mcp.exe'
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw ('freecad-mcp.exe was not created in {0}' -f $bin) }
@@ -702,6 +867,8 @@ function Unregister-ClaudeDesktop {
 }
 
 function Invoke-Uninstall {
+    # A running server would keep uv from removing its environment.
+    try { [void](Stop-ServerProcesses) } catch { Write-Log $_.Exception.Message }
     $uv = Find-Uv
     if ($uv) {
         Invoke-Logged -What 'uv tool uninstall freecad-mcp' -FilePath $uv.Path -TimeoutSec 120 -AllowFailure `
@@ -740,6 +907,9 @@ try {
         'InstallUv'               { Install-Uv }
         'InstallPython'           { Install-Python }
         'InstallFreeCAD'          { Install-FreeCAD }
+        'InstallClaudeDesktop'    { Install-ClaudeDesktop }
+        'FindServerProcesses'     { Invoke-FindServerProcesses }
+        'StopServerProcesses'     { Invoke-StopServerProcesses }
         'InstallServer'           { Install-Server }
         'InstallAddon'            { Install-Addon }
         'RegisterClaudeCode'      { Register-ClaudeCode }

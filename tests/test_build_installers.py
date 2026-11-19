@@ -230,6 +230,28 @@ def test_setup_helper_parses_in_windows_powershell() -> None:
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_installer_lists_the_claude_apps_and_copies_the_bundle_to_downloads() -> None:
+    inno = INNO.read_text(encoding="utf-8")
+    # The Requirements page shows both optional Claude apps next to the real dependencies.
+    assert [name for name in re.findall(r"CheckPage\.Add\('([^']+)'\)", inno)] == [
+        "uv", "Python", "FreeCAD", "Claude Desktop", "Claude Code",
+    ]
+    # The Downloads folder is asked of Windows (it is often moved), not assumed; this is the
+    # FOLDERID_Downloads known folder.
+    assert "{374DE290-123F-4565-9164-39C4925E467B}" in inno
+    assert "CopyBundleToDownloads;" in inno
+    assert "RegQueryStringValue(HKCU, RegKey, 'BundleCopy'" in inno  # and the uninstaller removes it
+
+
+def test_installer_script_has_no_stray_preprocessor_lines() -> None:
+    # Inno's preprocessor treats every line that starts with '#' as a directive, so a string
+    # continued onto a line beginning with #13#10 breaks the build.
+    allowed = {"define", "ifndef", "error", "endif", "include", "if", "else", "ifdef"}
+    lines = INNO.read_text(encoding="utf-8").splitlines()
+    stray = [number for number, line in enumerate(lines, 1) if line.lstrip().startswith("#") and line.lstrip()[1:].split(" ")[0] not in allowed]
+    assert stray == []
+
+
 def test_installer_only_calls_helper_actions_that_exist() -> None:
     inno = INNO.read_text(encoding="utf-8")
     helper = HELPER.read_text(encoding="utf-8")
@@ -238,7 +260,7 @@ def test_installer_only_calls_helper_actions_that_exist() -> None:
     assert validate_set is not None
     allowed = set(re.findall(r"'(\w+)'", validate_set.group(1)))
     dispatched = set(re.findall(r"^\s*'(\w+)'\s*\{", helper, re.MULTILINE))
-    assert {"RegisterClaudeCode", "RegisterClaudeDesktop", "Uninstall"} <= called
+    assert {"RegisterClaudeCode", "RegisterClaudeDesktop", "InstallClaudeDesktop", "Uninstall"} <= called
     assert called <= allowed
     assert allowed == dispatched
 
@@ -282,6 +304,7 @@ class Helper:
         self.server = root / "freecad-mcp.exe"
         self.server.write_bytes(b"")
         self.backups = root / "backup"
+        self.extra_env: dict[str, str] = {}
 
     def run(self, action: str, config: Path | None = None, *extra: str) -> tuple[int, dict[str, str]]:
         result = self.root / "result.txt"
@@ -296,6 +319,7 @@ class Helper:
         environment = {
             **os.environ,
             "LOCALAPPDATA": str(self.home / "Local"), "APPDATA": str(self.home / "Roaming"), "USERPROFILE": str(self.home),
+            **self.extra_env,
         }
         done = subprocess.run([*command, *extra], capture_output=True, text=True, timeout=120, env=environment)
         values: dict[str, str] = {}
@@ -391,6 +415,177 @@ def test_desktop_registration_creates_what_is_missing(helper: Helper, existing: 
     data = read_settings(config)
     assert data.pop("mcpServers") == {"freecad": {"command": str(helper.server)}}
     assert data == others
+
+
+FAKE_WINGET = """
+using System;
+using System.IO;
+class FakeWinget {
+    static void Make(string folder, string file) {
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, file), "");
+    }
+    static int Main(string[] args) {
+        string all = string.Join(" ", args);
+        File.AppendAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "winget-calls.txt"), all + "\\n");
+        if (Environment.GetEnvironmentVariable("FAKE_WINGET_MODE") != "install") return 1;
+        if (all.Contains("FreeCAD.FreeCAD")) {
+            Make(Path.Combine(Environment.GetEnvironmentVariable("ProgramFiles"), "FreeCAD 1.1", "bin"), "FreeCAD.exe");
+            return 0;
+        }
+        if (all.Contains("Anthropic.Claude")) {
+            Make(Path.Combine(Environment.GetEnvironmentVariable("LOCALAPPDATA"), "AnthropicClaude"), "claude.exe");
+            return 0;
+        }
+        return 1;
+    }
+}
+"""
+CSC = Path(os.environ.get("SystemRoot", "C:\\Windows")) / "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+# Keep detection inside the sandbox: no Store package, no real uninstall entries.
+NO_REAL_CLAUDE = ("-ClaudeDesktopPackage", "NoSuchClaudePackageForTests", "-IgnoreUninstallEntries")
+
+
+@pytest.fixture
+def fake_winget(helper: Helper) -> Path:
+    """A stand-in winget.exe that records its arguments. Tests pass it by path, never via PATH."""
+    if not CSC.is_file():
+        pytest.skip("the .NET Framework C# compiler is not available")
+    folder = helper.root / "fakewinget"
+    folder.mkdir()
+    (folder / "winget.cs").write_text(FAKE_WINGET, encoding="utf-8")
+    done = subprocess.run([str(CSC), "/nologo", f"/out:{folder / 'winget.exe'}", str(folder / "winget.cs")], capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    return folder / "winget.exe"
+
+
+def install_claude_desktop(helper: Helper, winget: Path, mode: str) -> tuple[int, dict[str, str]]:
+    helper.extra_env["FAKE_WINGET_MODE"] = mode
+    return helper.run("InstallClaudeDesktop", None, "-WingetPath", str(winget), *NO_REAL_CLAUDE)
+
+
+@windows_powershell
+def test_claude_desktop_is_installed_with_winget_when_missing(helper: Helper, fake_winget: Path) -> None:
+    code, result = install_claude_desktop(helper, fake_winget, "install")
+    assert (code, result) == (0, {"claude_desktop_installed": "installed"})
+    calls = (fake_winget.parent / "winget-calls.txt").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
+    assert calls[0].startswith("install --id Anthropic.Claude --exact --source winget --silent ")
+    assert "--accept-package-agreements" in calls[0] and "--disable-interactivity" in calls[0]
+
+
+@windows_powershell
+def test_claude_desktop_that_is_already_installed_is_left_alone(helper: Helper, fake_winget: Path) -> None:
+    program = helper.home / "Local" / "AnthropicClaude" / "claude.exe"
+    program.parent.mkdir(parents=True)
+    program.write_bytes(b"")
+    code, result = helper.run("InstallClaudeDesktop", None, "-WingetPath", str(fake_winget), *NO_REAL_CLAUDE)
+    assert (code, result) == (0, {"claude_desktop_installed": "already"})
+    assert not (fake_winget.parent / "winget-calls.txt").exists()  # winget was never called
+
+
+@windows_powershell
+def test_claude_desktop_install_failure_is_reported_with_the_manual_route(helper: Helper, fake_winget: Path) -> None:
+    code, result = install_claude_desktop(helper, fake_winget, "fail")
+    assert code == 1
+    assert "exit code 1" in result["error"] and "https://claude.ai/download" in result["error"]
+
+
+@windows_powershell
+def test_claude_desktop_install_needs_winget(helper: Helper) -> None:
+    code, result = helper.run("InstallClaudeDesktop", None, "-WingetPath", str(helper.root / "no-winget.exe"), *NO_REAL_CLAUDE)
+    assert code == 1 and "winget is not available" in result["error"] and "claude.ai/download" in result["error"]
+
+
+def install_freecad(helper: Helper, winget: Path, mode: str) -> tuple[int, dict[str, str]]:
+    # FreeCAD detection looks at Program Files, the PATH and the registry; keep all three in the sandbox.
+    system = os.environ.get("SystemRoot", "C:\\Windows")
+    helper.extra_env.update(
+        FAKE_WINGET_MODE=mode,
+        PATH=f"{system}\\System32;{system}",
+        # Upper-case: Python upper-cases the names in os.environ, and a differently cased duplicate would lose.
+        # PROGRAMW6432 too: on 64-bit Windows PowerShell takes $env:ProgramFiles from it.
+        **{
+            "PROGRAMFILES": str(helper.home / "Program Files"),
+            "PROGRAMW6432": str(helper.home / "Program Files"),
+            "PROGRAMFILES(X86)": str(helper.home / "Program Files (x86)"),
+        },
+    )
+    return helper.run("InstallFreeCAD", None, "-WingetPath", str(winget), "-IgnoreUninstallEntries")
+
+
+@windows_powershell
+def test_freecad_is_installed_with_winget_when_missing(helper: Helper, fake_winget: Path) -> None:
+    code, _ = install_freecad(helper, fake_winget, "install")
+    assert code == 0
+    calls = (fake_winget.parent / "winget-calls.txt").read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 1
+    assert calls[0].startswith("install --id FreeCAD.FreeCAD --exact --source winget --silent ")
+    assert "--accept-package-agreements" in calls[0] and "--disable-interactivity" in calls[0]
+    assert (helper.home / "Program Files" / "FreeCAD 1.1" / "bin" / "FreeCAD.exe").is_file()
+
+
+@windows_powershell
+def test_freecad_that_is_already_installed_is_left_alone(helper: Helper, fake_winget: Path) -> None:
+    program = helper.home / "Program Files" / "FreeCAD 1.1" / "bin" / "FreeCAD.exe"
+    program.parent.mkdir(parents=True)
+    program.write_bytes(b"")
+    assert install_freecad(helper, fake_winget, "install")[0] == 0
+    assert not (fake_winget.parent / "winget-calls.txt").exists()  # winget was never called
+
+
+@windows_powershell
+def test_freecad_install_failure_stops_setup_with_the_manual_route(helper: Helper, fake_winget: Path) -> None:
+    code, result = install_freecad(helper, fake_winget, "fail")
+    assert code == 1
+    assert "was not installed" in result["error"] and "https://www.freecad.org/downloads.php" in result["error"]
+
+
+@windows_powershell
+def test_freecad_install_needs_winget(helper: Helper) -> None:
+    code, result = install_freecad(helper, helper.root / "no-winget.exe", "install")
+    assert code == 1 and "winget is not available" in result["error"] and "freecad.org" in result["error"]
+
+
+@windows_powershell
+def test_running_servers_are_found_and_stopped_before_an_update(helper: Helper) -> None:
+    # Claude keeps `freecad-mcp.exe` and its python.exe running, and Windows then refuses to let
+    # `uv tool install` replace them ("Access is denied"). Stand-ins are copies of ping.exe placed
+    # where the real ones live; the real tool folders are never looked at.
+    ping = Path(os.environ["SystemRoot"]) / "System32" / "ping.exe"
+    tools, bin_dir = helper.root / "uvtools", helper.root / "uvbin"
+    helper.extra_env.update(UV_TOOL_DIR=str(tools), UV_TOOL_BIN_DIR=str(bin_dir))
+
+    def start(path: Path) -> subprocess.Popen:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ping, path)
+        return subprocess.Popen([str(path), "-t", "127.0.0.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    server_python = start(tools / "freecad-mcp" / "Scripts" / "python.exe")
+    launcher = start(bin_dir / "freecad-mcp.exe")
+    bystanders = [
+        start(helper.root / "elsewhere" / "python.exe"),                      # same name, another folder
+        start(tools / "some-other-tool" / "Scripts" / "python.exe"),          # another uv tool
+        start(bin_dir / "some-other-tool.exe"),
+    ]
+    everything = [server_python, launcher, *bystanders]
+    try:
+        code, found = helper.run("FindServerProcesses")
+        assert code == 0 and found["server_process_owners"]
+        # Exactly the two stand-ins: this is what makes the next step safe to run.
+        assert set(found["server_process_ids"].split(",")) == {str(server_python.pid), str(launcher.pid)}
+        assert found["server_processes"] == "2"
+
+        assert helper.run("StopServerProcesses") == (0, {"server_processes_stopped": "2"})
+        assert server_python.wait(timeout=15) is not None and launcher.wait(timeout=15) is not None
+        assert all(process.poll() is None for process in bystanders)
+
+        assert helper.run("FindServerProcesses")[1]["server_processes"] == "0"
+        assert helper.run("StopServerProcesses") == (0, {"server_processes_stopped": "0"})
+    finally:
+        for process in everything:
+            if process.poll() is None:
+                process.kill()
 
 
 class FileLock:
