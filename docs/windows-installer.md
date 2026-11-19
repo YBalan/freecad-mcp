@@ -180,23 +180,47 @@ the `windows` command above.
 
 ### Publish a GitHub release
 
-Commit and push first: the tag is `v<version>` on the current commit, and the
-script refuses an unpushed or dirty tree, or a tag or release that already
-exists. Then run the **Create GitHub release** task (it builds the installer
-first) or:
+Commit and push your work first: the script refuses a dirty tree or an unpushed
+commit, because GitHub can only tag a commit it has. Then run the **Create GitHub
+release** task, which asks for the mode and the version, or:
 
 ```powershell
-uv run python scripts/create_release.py --mode draft     # default: review on GitHub, then publish
-uv run python scripts/create_release.py --dry-run        # run every check, create nothing
+uv run python scripts/create_release.py                        # draft; a new patch version if the tag is taken
+uv run python scripts/create_release.py --mode publish         # publish immediately
+uv run python scripts/create_release.py --release-as minor     # bump the minor version first
+uv run python scripts/create_release.py --release-as replace   # delete and recreate the current release
+uv run python scripts/create_release.py --dry-run              # run every check, change nothing
 ```
 
 It needs the [GitHub CLI](https://cli.github.com/) logged in with `gh auth login`.
-`--mode publish` and `--mode prerelease` skip the draft step. The release notes
+The script builds the installer itself, after any version bump, so the files carry
+the released version; pass `--no-build` to attach files you built earlier with
+`build_installers.py` (and its `--validate` or `--iscc` options). The release notes
 list both downloads with SHA-256 checksums, since the files are not code-signed.
 
-Pass `--validate` to check the bundle manifest with Anthropic's `mcpb` CLI (needs
-Node.js and network) and `--iscc <path>` if Inno Setup is not auto-detected. The
-version comes from `addon/FreeCADMCP/package.xml`, so
-[`bump_version.py`](installation.md#update-the-release-version) remains the only
-place to change it. The pytest suite checks that the bundle manifest lists exactly
-the registered tools and that the bundle's entry point ignores unset settings.
+`--release-as` decides which version is released:
+
+| Value | What happens |
+| --- | --- |
+| `auto` (default) | The current version if its tag is free, otherwise the next free patch version. |
+| `current` | The current version only; fails if its tag or release already exists. |
+| `patch`, `minor`, `major` | Bump first: `package.xml` and `server.json` are updated, committed as `chore: release v<version>` (only those two files) and pushed, then the release is built and created. |
+| `replace` | Deletes the existing release and its tag, then creates it again. The old release is deleted only after the new files have built. |
+
+The version lives in `addon/FreeCADMCP/package.xml`, as before
+([`bump_version.py`](installation.md#update-the-release-version) still works on its
+own). Anything that commits, pushes or deletes asks first; deleting a *published*
+release makes you type its tag. Pass `--yes` for an unattended run. Prefer a new
+version over `replace` for anything people may have downloaded, since `replace`
+changes the files behind an existing version number.
+
+**Branches.** You can release from any branch; nothing here touches the default
+branch. The tag points at the commit you have checked out, a version bump is
+committed to and pushed from your current branch (never forced, and refused if the
+branch is behind its upstream or HEAD is detached), and a release made from any
+other branch is not marked **Latest**, so an unmerged build does not take over the
+repository's latest-release link (`--latest` overrides this). `--dry-run` prints the
+branch, the version change and what would be deleted.
+
+The pytest suite checks that the bundle manifest lists exactly the registered tools
+and that the bundle's entry point ignores unset settings.
